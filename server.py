@@ -3452,22 +3452,68 @@ def t_auto_edit(a):
                 ci, s, e = pieces[n]
                 return any(s <= (w["s"] + w["e"]) / 2.0 <= e for w in speech.get(ci, ()))
 
-            # lower score = dropped sooner
+            def movement(n):
+                """How much the picture changes across the shot.
+
+                Scoring on dialogue alone threw away a product being picked up and a
+                character dancing while colleagues stared - the reveal and the joke,
+                both silent, both the reason the ad works. Movement and novelty are
+                what those two have instead of a line.
+                """
+                import numpy as np
+                ci, s, e = pieces[n]
+                try:
+                    a_ = _frame_gray(srcs[ci], s + (e - s) * 0.25, width=64)
+                    b_ = _frame_gray(srcs[ci], s + (e - s) * 0.75, width=64)
+                    if a_ is None or b_ is None or a_.shape != b_.shape:
+                        return 0.0
+                    d = np.abs(a_.astype("float32") - b_.astype("float32")).mean() / 255.0
+                    return float(min(1.0, d * 6.0))
+                except Exception:
+                    return 0.0
+
+            def novelty(n):
+                """Unlike BOTH neighbours - a shot carrying something not already seen."""
+                before = looks_like_previous(n)
+                after = looks_like_previous(n + 1) if n + 1 < len(pieces) else 0.0
+                return 1.0 - max(before, after)
+
+            protect = set()
+            for tok in (a.get("protect_shots") or []):
+                try:
+                    protect.add(int(tok) - 1)
+                except (TypeError, ValueError):
+                    raise ToolError("protect_shots takes shot numbers, e.g. [3, 12].")
+            # The opening and the closing shot are never candidates. An advert ends on
+            # the product, and a held product shot is deliberately STILL - scoring it on
+            # movement dropped exactly the frame the whole thing exists to show.
+            protect.add(0)
+            protect.add(len(pieces) - 1)
+
+            # lower score = dropped sooner. Dialogue still leads. Novelty - being unlike
+            # BOTH neighbours - is the sounder second signal: movement flatters a shaky
+            # shot and punishes a composed one.
             scored = []
             for n in range(len(pieces)):
                 ci, s, e = pieces[n]
-                score = (2.0 if has_speech(n) else 0.0) - looks_like_previous(n)
+                if n in protect:
+                    continue                      # never offered up for trimming
+                score = (2.0 if has_speech(n) else 0.0) + 1.2 * novelty(n)
                 scored.append((score, e - s, n))
             scored.sort()                       # weakest first, shortest as tiebreak
             running = total_kept
-            for score, span, n in scored:
-                if running <= target + 0.4:
+            while scored:
+                if running <= target + 0.4 or len(pieces) - len(over) <= 3:
                     break
-                if len(pieces) - len(over) <= 3:
-                    break
-                over[n] = "%s, %s the shot before"
-                over[n] = ("carries dialogue" if score >= 2 else "silent") + \
-                          (", close to the shot before" if looks_like_previous(n) > 0.5 else "")
+                excess = running - target
+                # Of the weak shots, take one that roughly FITS what has to go. Taking
+                # the weakest regardless removed a 7.8s beat to shed 3s of excess, and
+                # the beat it removed carried a line of dialogue.
+                fits = [c for c in scored if c[1] <= excess + 1.5]
+                score, span, n = (fits or scored)[0]
+                scored.remove((score, span, n))
+                over[n] = ("silent" if score < 2 else "has dialogue") + \
+                          (", close to a neighbour" if novelty(n) < 0.5 else "")
                 running -= span
             if over:
                 log.append("target %.1fs: dropped %d shot(s) to fit, %.1fs -> %.1fs"
@@ -7524,6 +7570,11 @@ TOOLS = [
                                                "of ad. Given one, it drops the weakest shots "
                                                "to fit - silence before dialogue - and says "
                                                "which and why."},
+            "protect_shots": {"type": "array", "items": {"type": "integer"},
+                              "description": "Shot numbers that must survive the trim to "
+                                             "'target_duration' whatever they score - the "
+                                             "product reveal, the joke, the thing you know "
+                                             "matters and the machine cannot."},
             "respect_speech": {"type": "boolean",
                                "description": "Move any cut that lands inside a spoken word to "
                                               "the edge of it, so no line is severed. Default true."},
