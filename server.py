@@ -6079,6 +6079,163 @@ def t_compare(a):
                    "" if fontfile else " (no font found, so no labels drawn)", audio))
 
 
+# ---------------------------------------------------------------- finding music
+# Only these may be put under an advertisement.
+#   cc0 / pdm  - no strings
+#   by / by-sa - free to use commercially, but the creator MUST be credited
+# Everything else is excluded on purpose:
+#   *-nc  forbids commercial use, and an ad for a product you sell IS commercial
+#   *-nd  forbids derivatives, and trimming a track to length is a derivative
+# The distinction is invisible on the download page of most "free music" sites, which
+# is exactly how it ends up in a brand film by accident.
+MUSIC_OK = {"cc0": "no credit needed", "pdm": "public domain, no credit needed",
+            "by": "MUST credit the artist", "by-sa": "MUST credit the artist"}
+_LAST_FIND = {}
+
+
+def _openverse(query, page_size=20):
+    """Search Openverse. Anonymous access is rate limited, so say so when it bites.
+
+    Two things the API is strict about: a request with no User-Agent is refused outright
+    (403), and unauthenticated callers get a small hourly allowance, after which it
+    answers 401 rather than 429. Reporting that as "could not reach the library" sends
+    someone hunting a network problem they do not have.
+    """
+    import urllib.request, urllib.parse
+    url = "https://api.openverse.org/v1/audio/?" + urllib.parse.urlencode(
+        {"q": query, "page_size": min(50, max(1, page_size)),
+         "license_type": "commercial,modification"})
+    last = None
+    for attempt in range(3):
+        req = urllib.request.Request(url, headers={"User-Agent": "video-editor-mcp/1.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as fh:
+                return json.load(fh)
+        except Exception as e:
+            last = e
+            code = getattr(e, "code", None)
+            if code in (401, 403, 429) and attempt < 2:
+                time.sleep(2.0 * (attempt + 1))
+                continue
+            break
+    code = getattr(last, "code", None)
+    if code in (401, 429):
+        raise ToolError("The music library is rate limiting us (HTTP %s). Anonymous "
+                        "searches get a small hourly allowance and it is used up. Wait a "
+                        "few minutes and search again - already-downloaded tracks are "
+                        "unaffected." % code)
+    raise ToolError("Could not reach the music library (%s: %s). This is the only tool "
+                    "here that needs an internet connection."
+                    % (type(last).__name__, last))
+
+
+def t_music_find(a):
+    """Search openly-licensed music that may legally go under an advertisement."""
+    query = (a.get("query") or "").strip()
+    if not query:
+        raise ToolError("Give 'query': the mood or style, e.g. 'uplifting corporate'.")
+    want = float(a.get("min_seconds", 20))
+    limit = max(1, min(12, int(a.get("limit", 8))))
+
+    data = _openverse(query, 50)
+    rows, kept = [], []
+    for r in data.get("results", []):
+        lic = (r.get("license") or "").lower()
+        if lic not in MUSIC_OK:
+            continue                                   # belt and braces over the API filter
+        secs = (r.get("duration") or 0) / 1000.0
+        if secs < want:
+            continue
+        src = r.get("url")
+        if not src:
+            continue
+        kept.append({"title": r.get("title") or "untitled",
+                     "creator": r.get("creator") or "unknown",
+                     "license": lic, "seconds": secs, "url": src,
+                     "page": r.get("foreign_landing_url") or ""})
+        if len(kept) >= limit:
+            break
+
+    if not kept:
+        return ("Nothing matched '%s' at %.0f seconds or longer that is also cleared for "
+                "commercial use.\nTry a broader word (happy, calm, energetic, cinematic) or "
+                "a shorter min_seconds." % (query, want))
+
+    _LAST_FIND.clear()
+    for i, k in enumerate(kept, 1):
+        _LAST_FIND[i] = k
+        rows.append("%2d. %-40s %5.0fs  %-5s  %s\n      by %s"
+                    % (i, k["title"][:40], k["seconds"], k["license"],
+                       MUSIC_OK[k["license"]], k["creator"][:40]))
+    need = sorted(set(k["license"] for k in kept if k["license"] in ("by", "by-sa")))
+    note = ("\n\nTracks marked 'by' or 'by-sa' are free to use in an ad but the artist has "
+            "to be credited. music_fetch writes the credit line into ATTRIBUTION.txt beside "
+            "the file so it is not lost." if need else "")
+    return ("Music cleared for commercial use, %.0fs or longer, matching '%s':\n\n%s%s\n\n"
+            "Pick one with music_fetch(choice=N)." % (want, query, "\n".join(rows), note))
+
+
+def t_music_fetch(a):
+    """Download a track from the last search, and record what crediting it needs."""
+    folder = a.get("folder") or os.path.join(os.path.expanduser("~"), "Downloads", "music")
+    choice, url = a.get("choice"), a.get("url")
+    if choice is not None:
+        try:
+            pick = _LAST_FIND[int(choice)]
+        except (KeyError, ValueError, TypeError):
+            raise ToolError("No such choice. Run music_find first, then pass one of its "
+                            "numbers. (Known: %s)"
+                            % (", ".join(str(k) for k in sorted(_LAST_FIND)) or "none"))
+    elif url:
+        pick = {"title": a.get("title") or "track", "creator": a.get("creator") or "unknown",
+                "license": (a.get("license") or "cc0").lower(), "url": url, "page": url,
+                "seconds": 0}
+        if pick["license"] not in MUSIC_OK:
+            raise ToolError("Licence '%s' is not cleared for commercial use. Allowed: %s."
+                            % (pick["license"], ", ".join(sorted(MUSIC_OK))))
+    else:
+        raise ToolError("Give 'choice' (a number from music_find) or 'url'.")
+
+    os.makedirs(folder, exist_ok=True)
+    safe = re.sub(r"[^\w\- ]+", "", pick["title"]).strip()[:50] or "track"
+    dest = os.path.join(folder, "%s.mp3" % safe)
+    n = 2
+    while os.path.exists(dest):
+        dest = os.path.join(folder, "%s_%d.mp3" % (safe, n))
+        n += 1
+
+    import urllib.request
+    req = urllib.request.Request(pick["url"], headers={"User-Agent": "video-editor-mcp/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as fh, io.open(dest, "wb") as out:
+            shutil.copyfileobj(fh, out, 1 << 16)
+    except Exception as e:
+        raise ToolError("Download failed (%s: %s)." % (type(e).__name__, e))
+    if os.path.getsize(dest) < 8192:
+        os.remove(dest)
+        raise ToolError("That download came back empty.")
+
+    # A credit obligation you cannot find later is a credit obligation you will breach.
+    credit = ""
+    if pick["license"] in ("by", "by-sa"):
+        credit = ('"%s" by %s, licensed CC %s. %s'
+                  % (pick["title"], pick["creator"], pick["license"].upper(),
+                     pick.get("page") or pick["url"]))
+        with io.open(os.path.join(folder, "ATTRIBUTION.txt"), "a", encoding="utf-8") as fh:
+            fh.write("%s\n  file: %s\n\n" % (credit, os.path.basename(dest)))
+
+    try:
+        env, rate = _onset_envelope(dest)
+        bpm, beats = _beat_grid(env, rate)
+        tempo = "\n  %.1f BPM, %d beats - ready for video_cut_to_beat." % (bpm, len(beats))
+    except Exception:
+        tempo = ""
+    return done(dest, "\"%s\" by %s (CC %s - %s).%s%s"
+                % (pick["title"], pick["creator"], pick["license"].upper(),
+                   MUSIC_OK[pick["license"]], tempo,
+                   "\n  Credit line saved to ATTRIBUTION.txt:\n    " + credit if credit else ""))
+
+
 # ---------------------------------------------------------------- rhythm
 def _onset_envelope(path, sr=22050, hop=512, n_fft=1024):
     """Spectral flux: how much the sound CHANGES frame to frame.
@@ -6488,6 +6645,39 @@ TOOLS = [
             "keep_original_audio": {"type": "boolean"},
             "output": {"type": "string"}},
             "required": ["paths", "music"]},
+    },
+    {
+        "name": "music_find",
+        "description": "Search openly-licensed music that may legally go under an "
+                       "advertisement. Only CC0, public domain, BY and BY-SA are returned: "
+                       "NC licences forbid commercial use and ND licences forbid trimming a "
+                       "track to length, and neither distinction is visible on the download "
+                       "page of most 'free music' sites. Needs an internet connection.",
+        "handler": t_music_find,
+        "inputSchema": {"type": "object", "properties": {
+            "query": {"type": "string",
+                      "description": "Mood or style - 'uplifting corporate', 'calm piano', "
+                                     "'energetic pop'."},
+            "min_seconds": {"type": "number",
+                            "description": "Shorter than your video means an audible loop. "
+                                           "Default 20."},
+            "limit": {"type": "integer", "description": "How many to list. Default 8."}},
+            "required": ["query"]},
+    },
+    {
+        "name": "music_fetch",
+        "description": "Download a track found by music_find, measure its tempo, and write "
+                       "the credit line into ATTRIBUTION.txt when the licence requires one - "
+                       "a crediting obligation you cannot find later is one you will breach.",
+        "handler": t_music_fetch,
+        "inputSchema": {"type": "object", "properties": {
+            "choice": {"type": "integer", "description": "A number from the last music_find."},
+            "url": {"type": "string", "description": "Or a direct link you have checked "
+                                                     "yourself; then give 'license' too."},
+            "license": {"type": "string", "enum": sorted(MUSIC_OK)},
+            "title": {"type": "string"}, "creator": {"type": "string"},
+            "folder": {"type": "string", "description": "Default ~/Downloads/music."}},
+        },
     },
     {
         "name": "music_beats",
