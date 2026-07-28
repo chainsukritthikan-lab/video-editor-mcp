@@ -174,8 +174,66 @@ nothing:
  4. and_next_scene_i_want_it_to_be.mp4   0.00 -  2.34  (2.34s)
 ```
 
-Then re-run with `drop_shots: [4]`. **This matters when clips are alternate takes** — nothing
-can tell that two takes repeat the same line, so you drop the repeat yourself.
+Give it a **`target_duration`** and it prunes itself. Left alone it keeps every usable shot —
+four ten-second clips become thirty-five seconds of ad. Told to hit 25s, it drops the weakest
+shots until it fits, silence before dialogue, and says which and why:
+
+```
+      2. stress.mp4        1.96 -   6.54  (4.58s)
+ DROP 3. stress.mp4        6.54 -   8.00  (1.46s)  <- cut for length (silent)
+      5. turn.mp4          2.03 -   9.80  (7.77s)
+ DROP 9. joy.mp4           4.46 -   6.58  (2.12s)  <- cut for length (silent)
+Total kept: 24.86s across 7 shot(s).
+```
+
+It also refuses to cut inside a spoken word, and drops shots whose **line repeats** an earlier
+one — alternate takes of the same scene. Use `drop_shots: [n]` for anything else you do not
+want.
+
+**It still has no taste.** Scoring dialogue above silence means it will throw away a silent
+product reveal or a visual gag. Read the plan.
+
+## Checking your own work
+
+`video_check` reads the numbers. `video_review` **looks at the picture** — which is where
+every caption bug in this project was actually found:
+
+```
+Review of ad.mp4
+  24.80s, 7 shot(s), 8 sample(s), caption ink found in 8
+PROBLEMS (1):
+  - cut at 15.50s lands inside the word "โคตร" (15.43-15.73s)
+```
+
+It samples every caption cue, tiles them into one image to judge by eye, and flags what can
+be measured: caption ink reaching the frame edge, captions sitting under the platform's own
+buttons, cues wider than the font really fits, more lines than allowed, cuts landing inside a
+spoken word. Validated against a deliberately broken clip — a 31-wide cue and a four-line
+cue — and it caught both.
+
+`edit_history` records every call, so a folder of near-identical exports stops being a guess:
+
+```
+How final.mp4 was made, most recent step first:
+  1. video_reverse    from b.mp4
+  2. video_resize     Upscaled 2.4x, sharpened 55%   from a.mp4
+  3. video_trim       Cut from 1.00s, length 5.00s   from source.mp4
+```
+
+## Rhythm, voice, and shot craft
+
+| tool | what it does |
+|---|---|
+| `music_beats` | tempo and beat times, measured from the *rise* in each band — a beat is where something starts, not where it is loudest. Within 1–2% on known tempos |
+| `video_cut_to_beat` | trims each clip to a whole number of beats so the cutting and the pulse stay together |
+| `voice_over` | Thai or English narration, ducking the bed only while it talks. The one tool here that needs internet |
+| `video_censor` | bleeps or silences a range — a crude line fixed without reshooting |
+| `video_punch_in` | eases into a tighter framing and back out; reads as a move, not a jump |
+| `video_freeze` `video_reverse` `video_loop` | hold a frame, run it backwards, bounce it |
+| `video_picture_in_picture` | corner inset, or split side by side / stacked |
+| `video_stabilise` `video_chroma_key` `video_grade_lut` `video_remove_logo` | steady it, key it, grade it, patch out a bug |
+| `video_slideshow` | stills into a clip, each drifting so no frame sits dead |
+| `video_compare` | two versions side by side, labelled, so a change can be judged |
 
 ## Quality guard
 
