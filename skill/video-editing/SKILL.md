@@ -18,14 +18,18 @@ you add is the judging, so spend the time there and let the tools do the rest.
 3. **Plan, then prune.** `video_auto_edit` with `plan_only: true` and a
    `target_duration`. It fits the running time and drops silent filler, but it
    scores dialogue above everything - so it will throw away a silent product
-   reveal or a visual joke. Put those back by hand.
+   reveal or a visual joke. Name those in `protect_shots` and they survive
+   whatever they score. The opening and closing shots are already safe: an
+   advert ends on the product.
 4. **Render in this order.** Cut → `video_fix_audio` → `video_add_sfx` →
    music → `video_polish` → `video_fix_audio` again → captions.
    The second loudness pass is not redundant: music, effects and the polish
    pass all add level, and the peaks only clip once they are stacked.
-5. **Review before delivering.** `video_review` with the .srt you burned. It
-   catches captions running off the edge, cues with too many lines, captions
-   under the platform UI, and cuts landing inside a word.
+5. **Review before delivering.** `video_review` with the .srt you burned, then
+   `sound_faults`, then `video_check`. Three different questions: does the
+   picture read, does the mix have a fault, are the numbers right. Look at the
+   contact sheet `video_review` returns - that is where every caption bug in
+   this project was actually found.
 
 ## Thai captions
 
@@ -38,9 +42,26 @@ you add is the judging, so spend the time there and let the tools do the rest.
   belong to, so a break after one strands it.
 - **Two lines maximum.** Three reads as a wall.
 
+## Fonts
+
+Fifteen are registered, `fits` and `size` both measured by rendering rather than
+read off the font. Nine are text faces; **TH Charm of AU, TH Charmonman and TH
+Srisakdi are display faces** - titles and end cards, never running captions.
+Never invent a `fits` figure: deriving it from metrics once gave TH Krub 24
+characters when it really fits 20, and captions ran off both edges.
+
 ## Sound
 
 - **-14 LUFS, peaks at -1.5 dB.** That is what the platforms expect.
+- **`sound_faults` names what is wrong; it cannot say what is good.** It measures
+  a boxy low-mid pile-up, piercing sibilance, mains hum and a lifted noise floor,
+  each against figures measured from real material. Report the number with the
+  verdict. Whether a voice is convincing or music suits the film is not in it,
+  and saying otherwise is invention.
+- **`music_find` only returns music that may legally go under an advert** - CC0,
+  public domain, BY and BY-SA. NC forbids commercial use and ND forbids trimming
+  a track to length; neither is visible on a download page. `music_fetch` writes
+  the credit line to ATTRIBUTION.txt where one is owed.
 - **Let the music turn with the story.** One bed at one mood is what makes a cut
   feel flat. Generate two and crossfade them at the pivot - the moment the
   product works, the joke lands, the problem is solved.
@@ -60,9 +81,18 @@ you add is the judging, so spend the time there and let the tools do the rest.
 ## Traps that have actually bitten
 
 - **Filter arguments split on `,` and `:`.** Any computed expression or Windows
-  path inside one breaks the whole graph. Use `esc_expr()`, or run ffmpeg with
-  `cwd=` set and pass a bare filename. This has caused more bugs here than
-  anything else.
+  path inside one breaks the whole graph. Use `esc_expr()` for expressions,
+  `escape_filter_path()` **quoted** for paths (esc_expr doubles backslashes and
+  breaks them), or run ffmpeg with `cwd=` set and pass a bare filename. This has
+  caused more bugs here than anything else.
+- **Never escape text for `drawtext` by hand - use `drawtext_of()`.** It writes
+  the text to a file and sets `expansion=none`. Escaping inline meant "50% OFF"
+  rendered as NOTHING AT ALL, because drawtext read the `%` as a directive.
+- **Set thresholds from measurement, never from intuition.** Invented ones have
+  now shipped twice and been wrong twice: a caption detector that saw captions in
+  a close-up of teeth, and an audio checker that failed every file including the
+  clean one. Measure a known-good example and a deliberately broken one, then put
+  the threshold between them.
 - **Probe the video stream, not the container.** The container reports the
   longer of the two streams, so audio that ran past the picture has silently
   collapsed a whole cut before.
