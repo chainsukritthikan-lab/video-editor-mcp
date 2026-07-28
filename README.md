@@ -11,30 +11,54 @@ next to the source video.
 
 ---
 
-## Install (already done on this PC)
+## Install
 
-1. Python 3.12 ✅
-2. FFmpeg ✅ — installed with:
-   ```
-   winget install --id Gyan.FFmpeg -e
-   ```
+**1. Get the code**
 
-## Connect it to Claude Cowork
+```bash
+git clone https://github.com/chainsukritthikan-lab/video-editor-mcp.git
+```
 
-Settings → **Connectors** → **Add custom / local connector**, and use:
+**2. Required — Python 3.10+ and FFmpeg**
+
+```bash
+winget install --id Gyan.FFmpeg -e
+```
+
+macOS: `brew install ffmpeg`. Linux: your package manager. The server itself
+imports nothing outside the standard library, so there is no `pip install` step
+for the core.
+
+**3. Optional — only for the tools that need them**
+
+| Install | Unlocks |
+|---|---|
+| `pip install faster-whisper` | subtitles, transcripts, kinetic captions |
+| `pip install pythainlp` | Thai line breaks that land on real word boundaries |
+| `pip install numpy scipy` | beat detection, visual QA |
+| `pip install mediapipe` | face-following reframe, sound identification |
+| `pip install edge-tts` | voice-over |
+| `npm install` in `motion/` | the animated caption and title renderer |
+
+Each tool tells you what is missing if you call it without the dependency.
+
+**4. Point Claude at it**
+
+Settings → **Connectors** → **Add custom / local connector**:
 
 - **Name:** `video-editor`
 - **Command:** `python`
-- **Arguments:** `<path-to>\video-editor-mcp\video-editor-mcp\server.py`
+- **Arguments:** the full path to `server.py`
 
-Or paste this JSON if the dialog accepts JSON:
+Or add it to `~/.claude.json`. Putting it at the **top level** rather than under
+`projects` makes it available in every session, not just one folder:
 
 ```json
 {
   "mcpServers": {
     "video-editor": {
       "command": "python",
-      "args": ["<path-to>\\video-editor-mcp\\video-editor-mcp\\server.py"]
+      "args": ["/full/path/to/video-editor-mcp/server.py"]
     }
   }
 }
