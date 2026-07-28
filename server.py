@@ -616,27 +616,41 @@ def t_text(a):
     text = (a.get("text") or "").strip()
     if not text:
         raise ToolError("'text' is empty.")
-    safe = text.replace("\\", "\\\\").replace(":", "\\:").replace("'", "’").replace("%", "\\%")
     size = int(a.get("font_size", 48))
     pos = (a.get("position") or "bottom-center")
-    xy = {"top-left": "x=40:y=40", "top-center": "x=(w-text_w)/2:y=40",
-          "top-right": "x=w-text_w-40:y=40", "center": "x=(w-text_w)/2:y=(h-text_h)/2",
-          "bottom-left": "x=40:y=h-text_h-40", "bottom-center": "x=(w-text_w)/2:y=h-text_h-40",
-          "bottom-right": "x=w-text_w-40:y=h-text_h-40"}.get(pos)
+    xy = {"top-left": ("40", "40"), "top-center": ("(w-text_w)/2", "40"),
+          "top-right": ("w-text_w-40", "40"),
+          "center": ("(w-text_w)/2", "(h-text_h)/2"),
+          "bottom-left": ("40", "h-text_h-40"),
+          "bottom-center": ("(w-text_w)/2", "h-text_h-40"),
+          "bottom-right": ("w-text_w-40", "h-text_h-40")}.get(pos)
     if xy is None:
         raise ToolError("position must be one of: %s" % ", ".join(POSITIONS))
-    d = "drawtext=text='%s':fontsize=%d:fontcolor=%s:borderw=3:bordercolor=black@0.8:%s" % (
-        safe, size, a.get("color") or "white", xy)
+
+    tmp = _tmpdir()
+    opts = dict(fontsize=size, fontcolor=a.get("color") or "white",
+                borderw=3, bordercolor="black@0.8", x=xy[0], y=xy[1])
     start = parse_time(a.get("start"), "start")
     end = parse_time(a.get("end"), "end")
     if start is not None or end is not None:
-        d += ":enable='between(t,%.3f,%.3f)'" % (start or 0, end if end is not None else duration_of(src))
+        opts["enable"] = "'between(t\\,%.3f\\,%.3f)'" % (
+            start or 0, end if end is not None else duration_of(src))
     fontfile = r"C:\Windows\Fonts\tahoma.ttf"
     if os.path.isfile(fontfile):
-        d += ":fontfile='%s'" % escape_filter_path(fontfile)
+        # A PATH wants escape_filter_path (slashes flipped, colon escaped), not
+        # esc_expr - the latter doubles backslashes. It must also be QUOTED: an
+        # escaped colon in a bare value still ends the option.
+        opts["fontfile"] = "'%s'" % escape_filter_path(fontfile)
+    d = drawtext_of(text, tmp, **opts)
+
     out = make_output(src, "text", a.get("output"), ".mp4")
-    ffmpeg_run(["-i", src, "-vf", d] + VIDEO_ENC + ["-c:a", "copy", out])
-    return done(out, "Text added.")
+    # cwd is the temp folder so the textfile can be named without a path.
+    p = subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", os.path.abspath(src),
+                        "-vf", d] + VIDEO_ENC + ["-c:a", "copy", os.path.abspath(out)],
+                       cwd=tmp, capture_output=True, text=True)
+    if p.returncode:
+        raise ToolError("Adding text failed:\n" + (p.stderr or "").strip()[-400:])
+    return done(out, "Text added: %s" % text[:60])
 
 
 def t_to_gif(a):
@@ -3137,7 +3151,7 @@ def t_end_card(a):
     fps = int(a.get("fps") or 24)
 
     font = r"C:\Windows\Fonts\tahomabd.ttf"
-    fontfile = ":fontfile='%s'" % escape_filter_path(font) if os.path.isfile(font) else ""
+    card_tmp = _tmpdir()
 
     chain = ["[0:v]format=yuv420p[bg]"]
     last = "[bg]"
@@ -3154,10 +3168,14 @@ def t_end_card(a):
         return int(size * limit / est) if est > limit else size
 
     def draw(text, size, y, label_in, label_out, delay):
-        safe = text.replace("\\", "\\\\").replace(":", "\\:").replace("'", "’").replace("%", "\\%")
-        return ("%sdrawtext=text='%s':fontsize=%d:fontcolor=%s:x=(w-text_w)/2:y=%s%s"
-                ":alpha='min(1,max(0,(t-%.2f)/0.4))'%s"
-                % (label_in, safe, fit(text, size), fg, y, fontfile, delay, label_out))
+        # Read from a file rather than escaping inline: a title of "50% OFF" rendered as
+        # nothing at all, because drawtext read the % as the start of an expansion.
+        opts = {"fontsize": fit(text, size), "fontcolor": fg,
+                "x": "(w-text_w)/2", "y": y,
+                "alpha": "'min(1\\,max(0\\,(t-%.2f)/0.4))'" % delay}
+        if os.path.isfile(font):
+            opts["fontfile"] = "'%s'" % escape_filter_path(font)
+        return "%s%s%s" % (label_in, drawtext_of(text, card_tmp, **opts), label_out)
 
     ty = "(h-text_h)/2+%d" % int(h * 0.10) if logo else "(h-text_h)/2-%d" % int(h * 0.02)
     if title:
@@ -3169,15 +3187,19 @@ def t_end_card(a):
         last = "[t2]"
     chain.append("%sfade=t=in:st=0:d=0.4[outv]" % last)
 
-    card = os.path.join(_tmpdir(), "card_%d.mp4" % os.getpid())
+    card = os.path.join(card_tmp, "card_%d.mp4" % os.getpid())
     args = ["-f", "lavfi", "-i", "color=c=%s:s=%dx%d:r=%d:d=%.2f" % (bg, w, h, fps, dur)]
     if logo:
-        args += ["-i", logo]
+        args += ["-i", os.path.abspath(logo)]
     args += ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
              "-filter_complex", ";".join(chain), "-map", "[outv]",
              "-map", "%d:a" % (2 if logo else 1), "-t", "%.2f" % dur]
     args += VIDEO_ENC + AUDIO_ENC + [card]
-    ffmpeg_run(args)
+    # Run from the temp folder: drawtext reads its text from bare-named files there.
+    p = subprocess.run(["ffmpeg", "-y", "-v", "error"] + args, cwd=card_tmp,
+                       capture_output=True, text=True)
+    if p.returncode:
+        raise ToolError("Building the end card failed:\n" + (p.stderr or "").strip()[-400:])
 
     out = make_output(src, "endcard", a.get("output"), ".mp4")
     try:
@@ -5694,6 +5716,34 @@ def t_edit_history(a):
 
 
 # ---------------------------------------------------------------- surgery
+_DT_SEQ = [0]
+
+
+def drawtext_of(text, tmp, **opts):
+    r"""Build a drawtext filter that renders the text EXACTLY as given.
+
+    Escaping text inline is a losing game. drawtext reads `%{...}` as an expansion, so a
+    plain "50% off today" silently rendered NOTHING at all - not mangled, absent - and a
+    backslash disappeared without trace. Hand-escaping also meant swapping real
+    apostrophes for curly ones to dodge the quote character.
+
+    Writing the text to a file and pointing `textfile=` at it removes the whole problem:
+    ffmpeg reads it verbatim, and `expansion=none` stops it looking for directives. The
+    file needs a bare name with cwd set, since a Windows path in a filter argument breaks
+    the graph on the drive-letter colon.
+    """
+    _DT_SEQ[0] += 1
+    name = "dt_%d_%d.txt" % (os.getpid(), _DT_SEQ[0])
+    with io.open(os.path.join(tmp, name), "w", encoding="utf-8") as fh:
+        fh.write(text)
+    parts = ["drawtext=textfile=%s" % name, "expansion=none"]
+    for k, v in opts.items():
+        if v is None:
+            continue
+        parts.append("%s=%s" % (k, v))
+    return ":".join(parts)
+
+
 def esc_expr(expr):
     r"""Escape an expression for use as a filter OPTION VALUE.
 
