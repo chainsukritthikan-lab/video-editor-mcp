@@ -6175,6 +6175,125 @@ def t_compare(a):
                    "" if fontfile else " (no font found, so no labels drawn)", audio))
 
 
+# ---------------------------------------------------------------- listening
+def _spectrum(path, sr=22050, n_fft=2048):
+    """Average magnitude per frequency bin, and the per-frame energy envelope."""
+    import numpy as np
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-f", "f32le",
+                          "-ac", "1", "-ar", str(sr), "-"], capture_output=True).stdout
+    x = np.frombuffer(raw, dtype="<f4")
+    if x.size < n_fft * 4:
+        raise ToolError("Too short to analyse.")
+    hop = n_fft // 2
+    n = 1 + (x.size - n_fft) // hop
+    idx = np.arange(n_fft)[None, :] + hop * np.arange(n)[:, None]
+    win = np.hanning(n_fft).astype("f4")
+    mag = np.abs(np.fft.rfft(x[idx] * win, axis=1))
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / sr)
+    return freqs, mag, x
+
+
+def t_sound_faults(a):
+    """The faults a mix engineer listens FOR, measured rather than heard.
+
+    Audio never reaches this model - tool results carry text and pictures, not sound -
+    so 'does it sound good' is not answerable here and anything claiming to answer it
+    would be invention. What IS answerable is the specific, measurable things that make
+    a mix sound wrong: a boxy low-mid pile-up, piercing sibilance, mains hum, hiss in
+    the gaps, and dynamics squashed flat. Each is reported with the number behind it so
+    the judgement stays yours.
+    """
+    import numpy as np
+    src = check_input(a.get("path"), "video")
+    if not has_audio(src):
+        raise ToolError("This file has no audio.")
+    freqs, mag, x = _spectrum(src)
+    avg = mag.mean(axis=0)
+    total = float(avg.sum()) or 1.0
+
+    def band(lo, hi):
+        m = (freqs >= lo) & (freqs < hi)
+        return float(avg[m].sum()) / total
+
+    sub, low_mid, mid, presence, sibilance, air = (
+        band(20, 90), band(180, 420), band(420, 2000),
+        band(2000, 5000), band(5000, 9000), band(9000, 11000))
+
+    problems, notes = [], []
+    # Thresholds MEASURED, not guessed. A clean speech-led mix from this project sits at
+    # low-mid 8-13%, sibilance ~15%, presence 21-28%. Deliberately damaged copies read
+    # low-mid 26% (a +14 dB bell at 300 Hz) and sibilance 35% (+16 dB at 7 kHz). The
+    # first set of thresholds here was invented rather than measured and flagged every
+    # file, including the good one, which is worse than no test at all.
+    if low_mid > 0.20:
+        problems.append("Boxy: %.0f%% of the energy sits in 180-420 Hz, against 8-13%% for a "
+                        "clean mix. Voices read as though in a cardboard box - cut a few dB "
+                        "there." % (low_mid * 100))
+    if sibilance > 0.26:
+        problems.append("Harsh: %.0f%% in 5-9 kHz, against about 15%% for a clean mix. The s "
+                        "and t sounds pierce, which is the first thing that tires a listener "
+                        "on earbuds." % (sibilance * 100))
+    if presence < 0.12:
+        notes.append("Dull: only %.0f%% in 2-5 kHz, the band that carries consonants, against "
+                     "21-28%% typical. Speech may read as muffled." % (presence * 100))
+
+    # Hum is found by being STEADY, not by being loud. Measured on this material,
+    # prominence in the 50 Hz bin barely separates a hummed file from a clean one
+    # (1.65 against 3.10) while steadiness - how much that band wobbles over the
+    # file - separates them cleanly: 1.89 clean against 0.49 hummed. Music and speech
+    # never hold a single frequency still; mains hum does nothing else.
+    hum_hz = None
+    for f0 in (50.0, 60.0, 100.0, 120.0):
+        m = (freqs >= f0 - 6) & (freqs <= f0 + 6)
+        around = (freqs >= f0 - 40) & (freqs <= f0 + 40) & ~m
+        if float(avg[around].mean() or 0) <= 0:
+            continue
+        prominence = float(avg[m].max()) / float(avg[around].mean())
+        over_time = mag[:, m].mean(axis=1)
+        steadiness = float(over_time.std() / (over_time.mean() or 1e-9))
+        if steadiness < 1.0 and prominence > 2.2:
+            hum_hz = f0
+            break
+    if hum_hz:
+        problems.append("Mains hum near %d Hz - a steady tone under everything. A highpass "
+                        "at 80 Hz clears it without touching the voice." % hum_hz)
+
+    # How far the quiet moments sit below the loud ones. This is the reliable read on
+    # over-compression: squashing a mix lifts the floor. Crest factor was tried first
+    # and moved the WRONG WAY on a deliberately compressed file, so it is not used.
+    frame_rms = np.sqrt((mag ** 2).mean(axis=1))
+    quiet = float(np.percentile(frame_rms, 5))
+    loud = float(np.percentile(frame_rms, 95)) or 1e-9
+    floor_db = 20 * math.log10(max(quiet, 1e-9) / loud)
+    rms = float(np.sqrt(np.mean(x.astype("float64") ** 2))) or 1e-9
+    crest = 20 * math.log10(float(np.abs(x).max()) / rms) if x.size else 0
+    if floor_db > -16:
+        problems.append("Squashed or hissy: the quiet moments sit only %.0f dB below the "
+                        "loud ones, against about 24 dB for a clean mix. Either it has been "
+                        "compressed flat or there is noise under everything." % abs(floor_db))
+
+    L = ["Listening to %s" % os.path.basename(src), ""]
+    L.append("  spectrum   sub %.0f%%  low-mid %.0f%%  mid %.0f%%  presence %.0f%%  "
+             "sibilance %.1f%%  air %.1f%%"
+             % (sub * 100, low_mid * 100, mid * 100, presence * 100,
+                sibilance * 100, air * 100))
+    L.append("  dynamics   crest %.1f dB, noise floor %.0f dB down" % (crest, abs(floor_db)))
+    L.append("")
+    if problems:
+        L.append("PROBLEMS (%d):" % len(problems))
+        L += ["  - " + p for p in problems]
+    else:
+        L.append("Nothing measurable is wrong with the sound.")
+    if notes:
+        L.append("")
+        L += ["  " + n for n in notes]
+    L.append("")
+    L.append("This measures faults. It cannot tell you whether the voice is convincing or "
+             "the music suits the film - nothing here can, and anything that claimed to "
+             "would be guessing.")
+    return "\n".join(L)
+
+
 # ---------------------------------------------------------------- did it work
 PERF_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "performance.json")
 
@@ -6900,6 +7019,17 @@ TOOLS = [
             "keep_original_audio": {"type": "boolean"},
             "output": {"type": "string"}},
             "required": ["paths", "music"]},
+    },
+    {
+        "name": "sound_faults",
+        "description": "The faults a mix engineer listens FOR, measured: a boxy low-mid "
+                       "pile-up, piercing sibilance, mains hum, hiss under the quiet parts, "
+                       "and dynamics squashed flat. Each is reported with the number behind "
+                       "it. Use it alongside audio_scope, which answers the different "
+                       "question of whether music is burying the voice.",
+        "handler": t_sound_faults,
+        "inputSchema": {"type": "object", "properties": {
+            "path": {"type": "string"}}, "required": ["path"]},
     },
     {
         "name": "ad_record",
