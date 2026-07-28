@@ -1,0 +1,17 @@
+{
+  "_comment": "House styles. Copy to presets.json and edit, or build them with the brand_preset tool. Whatever you save there is yours and is not tracked by git.",
+  "example_brand": {
+    "style": "cinematic",
+    "subtitles": "th",
+    "subtitle_style": "clean",
+    "sfx": "transition",
+    "music": "uplifting",
+    "music_level": 0.22,
+    "aspect": "9:16",
+    "fps": 30,
+    "end_title": "To be continued",
+    "end_subtitle": "YOUR BRAND  ·  TAGLINE",
+    "end_background": "#0d2b4a",
+    "end_duration": 2.6
+  }
+}

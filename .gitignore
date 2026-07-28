@@ -1,0 +1,15 @@
+# Remotion pulls ~630 MB of packages; `npm install` in motion/ restores them.
+motion/node_modules/
+motion/out/
+
+__pycache__/
+*.pyc
+
+# Local edit log - it is a list of paths on one machine, nobody else's business.
+history.jsonl
+
+# Cached analysis, keyed to local files.
+.cache/
+
+# Your own house styles. presets.example.json is the one that ships.
+presets.json
