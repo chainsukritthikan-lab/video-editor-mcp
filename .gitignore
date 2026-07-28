@@ -13,3 +13,6 @@ history.jsonl
 
 # Your own house styles. presets.example.json is the one that ships.
 presets.json
+
+# Your real numbers, from your accounts. Nobody else's business.
+performance.json

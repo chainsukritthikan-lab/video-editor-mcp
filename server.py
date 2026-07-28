@@ -6079,6 +6079,165 @@ def t_compare(a):
                    "" if fontfile else " (no font found, so no labels drawn)", audio))
 
 
+# ---------------------------------------------------------------- did it work
+PERF_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "performance.json")
+
+
+def _perf_load():
+    if not os.path.isfile(PERF_FILE):
+        return []
+    try:
+        return json.load(io.open(PERF_FILE, encoding="utf-8"))
+    except (ValueError, OSError):
+        return []
+
+
+def _edit_shape(path):
+    """The measurable facts about how a cut was made.
+
+    Only things that can be read off the file. How long it is, how fast it cuts, how
+    much of it is someone talking - the levers that were actually pulled while editing,
+    so they can later be set against how the post did.
+    """
+    shape = {}
+    try:
+        total = video_duration_of(path)
+        shape["seconds"] = round(total, 2)
+        cuts = [c for c in _review_cuts(path) if 0.2 < c < total - 0.2]
+        shape["shots"] = len(cuts) + 1
+        shape["avg_shot"] = round(total / max(1, len(cuts) + 1), 2)
+    except Exception:
+        return shape
+    try:
+        if has_audio(path):
+            words, _l = _word_timings(path, "auto", "large-v3")
+            talk = sum(w["e"] - w["s"] for w in words)
+            shape["talk_share"] = round(min(1.0, talk / max(0.1, shape["seconds"])), 3)
+            if words:
+                shape["first_word_at"] = round(words[0]["s"], 2)
+    except Exception:
+        pass
+    return shape
+
+
+def t_ad_record(a):
+    """Log how a published edit actually performed, against how it was cut."""
+    src = check_input(a.get("path"), "video")
+    views = a.get("views")
+    if views is None:
+        raise ToolError("Give at least 'views'. The rest are optional but the more you "
+                        "give, the sooner patterns mean anything.")
+
+    def num(k):
+        v = a.get(k)
+        try:
+            return None if v is None else float(v)
+        except (TypeError, ValueError):
+            raise ToolError("'%s' must be a number." % k)
+
+    entry = {"file": os.path.basename(src), "path": os.path.abspath(src),
+             "platform": (a.get("platform") or "tiktok").lower(),
+             "posted": a.get("posted") or time.strftime("%Y-%m-%d"),
+             "logged": time.strftime("%Y-%m-%d %H:%M"),
+             "views": num("views"), "likes": num("likes"), "comments": num("comments"),
+             "shares": num("shares"), "saves": num("saves"),
+             "watch_through": num("watch_through"),      # % who reached the end
+             "avg_watch_seconds": num("avg_watch_seconds"),
+             "note": a.get("note") or "", "shape": _edit_shape(src)}
+
+    rows = [r for r in _perf_load()
+            if not (r.get("path") == entry["path"] and r.get("platform") == entry["platform"])]
+    rows.append(entry)
+    with io.open(PERF_FILE, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(rows, ensure_ascii=False, indent=1))
+
+    s = entry["shape"]
+    return ("Recorded %s on %s: %s views%s.\n"
+            "  How it was cut: %.1fs, %d shot(s), average %.1fs each%s.\n"
+            "  %d ad(s) logged so far. %s"
+            % (entry["file"], entry["platform"], _pretty(entry["views"]),
+               ", %.0f%% watched to the end" % entry["watch_through"]
+               if entry["watch_through"] is not None else "",
+               s.get("seconds", 0), s.get("shots", 0), s.get("avg_shot", 0),
+               ", talking %.0f%% of the time" % (s["talk_share"] * 100)
+               if "talk_share" in s else "",
+               len(rows),
+               "Run ad_insights once there are a few to compare." if len(rows) < 4
+               else "ad_insights can compare them now."))
+
+
+def _pretty(n):
+    if n is None:
+        return "?"
+    for unit, div in (("M", 1e6), ("K", 1e3)):
+        if n >= div:
+            return "%.1f%s" % (n / div, unit)
+    return "%d" % n
+
+
+def t_ad_insights(a):
+    """Set how each ad was cut against how it did - and refuse to invent a pattern.
+
+    Four numbers do not make a trend. With a handful of posts the honest answer is a
+    ranked list and nothing more; claiming a correlation from five samples is how people
+    end up certain of something that was noise.
+    """
+    rows = _perf_load()
+    metric = (a.get("metric") or "watch_through").lower()
+    if metric not in ("watch_through", "views", "likes", "avg_watch_seconds"):
+        raise ToolError("metric must be watch_through, views, likes or avg_watch_seconds.")
+    usable = [r for r in rows if r.get(metric) is not None]
+    if not usable:
+        return ("Nothing logged with '%s' yet.\nRecord some posts with ad_record - views "
+                "at minimum, watch_through if the app shows it, since that is the number "
+                "that actually reflects the edit." % metric)
+
+    usable.sort(key=lambda r: r[metric], reverse=True)
+    out = ["%d ad(s) ranked by %s:" % (len(usable), metric), ""]
+    for r in usable:
+        s = r.get("shape") or {}
+        out.append("  %-34s %8s   %.0fs  %d shots  avg %.1fs%s"
+                   % (r["file"][:34], _pretty(r[metric]), s.get("seconds", 0),
+                      s.get("shots", 0), s.get("avg_shot", 0),
+                      "  talk %.0f%%" % (s["talk_share"] * 100) if "talk_share" in s else ""))
+
+    if len(usable) < 5:
+        out += ["", "Too few to draw anything from. %d more and the shape of what works "
+                    "starts to show; below that it is noise wearing a pattern's clothes."
+                    % (5 - len(usable))]
+        return "\n".join(out)
+
+    # Rank correlation: does a lever move WITH the result, whichever way?
+    def spearman(xs, ys):
+        n = len(xs)
+        rx = {v: i for i, v in enumerate(sorted(xs))}
+        ry = {v: i for i, v in enumerate(sorted(ys))}
+        d2 = sum((rx[x] - ry[y]) ** 2 for x, y in zip(xs, ys))
+        return 1 - (6.0 * d2) / (n * (n * n - 1)) if n > 2 else 0.0
+
+    out += ["", "What moves with %s:" % metric]
+    for lever, label in (("seconds", "length"), ("shots", "number of shots"),
+                         ("avg_shot", "average shot length"),
+                         ("talk_share", "how much talking"),
+                         ("first_word_at", "how soon the talking starts")):
+        pairs = [(r["shape"][lever], r[metric]) for r in usable
+                 if isinstance(r.get("shape"), dict) and lever in r["shape"]]
+        if len(pairs) < 5:
+            continue
+        rho = spearman([p[0] for p in pairs], [p[1] for p in pairs])
+        if abs(rho) < 0.5:
+            verdict = "no clear link"
+        else:
+            verdict = ("shorter does better" if rho < 0 else "longer does better") \
+                if lever in ("seconds", "avg_shot", "first_word_at") else \
+                ("less does better" if rho < 0 else "more does better")
+        out.append("  %-26s rho %+.2f   %s" % (label, rho, verdict))
+    out += ["", "Rank correlation across %d posts. It says what moved together, not what "
+                "caused what - a good hook and a short cut often arrive in the same video."
+            % len(usable)]
+    return "\n".join(out)
+
+
 # ---------------------------------------------------------------- finding music
 # Only these may be put under an advertisement.
 #   cc0 / pdm  - no strings
@@ -6645,6 +6804,43 @@ TOOLS = [
             "keep_original_audio": {"type": "boolean"},
             "output": {"type": "string"}},
             "required": ["paths", "music"]},
+    },
+    {
+        "name": "ad_record",
+        "description": "Log how a published edit actually performed, alongside how it was "
+                       "cut. Read the numbers off TikTok or Instagram and pass them in - "
+                       "this measures the edit itself (length, shot count, pace, how much "
+                       "talking) so the two can later be set against each other. Everything "
+                       "else here judges whether an edit is technically correct; this is the "
+                       "only thing that knows whether it worked.",
+        "handler": t_ad_record,
+        "inputSchema": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "The video that was posted."},
+            "platform": {"type": "string", "description": "tiktok, instagram, facebook, line..."},
+            "views": {"type": "number"},
+            "watch_through": {"type": "number",
+                              "description": "Percent who reached the end. The number that "
+                                             "reflects the EDIT rather than the thumbnail."},
+            "avg_watch_seconds": {"type": "number"},
+            "likes": {"type": "number"}, "comments": {"type": "number"},
+            "shares": {"type": "number"}, "saves": {"type": "number"},
+            "posted": {"type": "string", "description": "YYYY-MM-DD. Defaults to today."},
+            "note": {"type": "string", "description": "Anything unusual - a boost, a trend, "
+                                                      "a collaboration."}},
+            "required": ["path", "views"]},
+    },
+    {
+        "name": "ad_insights",
+        "description": "Compare the ads you have logged: what was cut how, against how each "
+                       "one did. Below five posts it ranks them and says plainly that there "
+                       "is nothing to conclude - a correlation from four samples is noise "
+                       "wearing a pattern's clothes.",
+        "handler": t_ad_insights,
+        "inputSchema": {"type": "object", "properties": {
+            "metric": {"type": "string",
+                       "enum": ["watch_through", "views", "likes", "avg_watch_seconds"],
+                       "description": "What to rank by. Default watch_through."}},
+        },
     },
     {
         "name": "music_find",
