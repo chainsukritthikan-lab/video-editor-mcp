@@ -300,3 +300,14 @@ Times accept `12.5` seconds or `1:30` (MM:SS).
   python "<path-to>\video-editor-mcp\video-editor-mcp\server.py"
   ```
   It should sit there silently waiting. Ctrl+C to quit. Any crash text = a real problem.
+
+---
+
+## The skill
+
+`skill/video-editing/SKILL.md` is the other half of this repo: the workflow and
+the traps, written down so a session starts from what was already learned rather
+than from nothing. The connector measures; the skill is the judging.
+
+Copy it to `~/.claude/skills/video-editing/SKILL.md` and it loads automatically
+whenever you ask for video work.
