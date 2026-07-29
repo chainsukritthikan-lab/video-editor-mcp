@@ -1593,12 +1593,45 @@ def t_join_smooth(a):
         cur = out
     if audio:
         acur = "[a0]"
-        for i in range(1, len(srcs)):
-            out = "[ax%d]" % i
-            # Equal-power curves; a linear crossfade dips in the middle on
-            # uncorrelated material.
-            parts.append("%s[a%d]acrossfade=d=%.3f:c1=qsin:c2=qsin%s" % (acur, i, a_cross, out))
-            acur = out
+        # A J-cut brings the next shot's sound in BEFORE its picture; an L-cut lets the
+        # last shot's sound run on UNDER the new picture. It is the commonest move in
+        # dialogue editing and the reason cut footage stops sounding cut. Chained
+        # acrossfade cannot express it - each join lands wherever the streams happen to
+        # meet - so when a lead is asked for, every clip's audio is placed at an
+        # absolute position on the output timeline instead and the whole lot mixed.
+        leads = []
+        for i in range(len(srcs) - 1):
+            j = (junctions[i] if junctions else {}) or {}
+            leads.append(float(j.get("audio_lead", a.get("audio_lead", 0)) or 0))
+
+        if any(abs(x) > 0.01 for x in leads):
+            v_at, at = [0.0], 0.0
+            for i in range(1, len(srcs)):
+                at = at + durs[i - 1] - plan[i - 1][1]
+                v_at.append(at)
+            mixed = []
+            for i, s in enumerate(srcs):
+                # positive lead = audio arrives early (J), negative = it lingers (L)
+                start = v_at[i] - (leads[i - 1] if i else 0.0)
+                shift = max(0.0, start)
+                fade = max(0.05, a_cross)
+                head = "afade=t=in:st=0:d=%.3f," % fade if i else ""
+                tail = "afade=t=out:st=%.3f:d=%.3f," % (max(0.0, durs[i] - fade), fade) \
+                    if i < len(srcs) - 1 else ""
+                parts.append("[a%d]%s%sadelay=%d|%d[am%d]"
+                             % (i, head, tail, int(shift * 1000), int(shift * 1000), i))
+                mixed.append("[am%d]" % i)
+            acur = "[amix]"
+            parts.append("%samix=inputs=%d:duration=longest:normalize=0%s"
+                         % ("".join(mixed), len(mixed), acur))
+        else:
+            for i in range(1, len(srcs)):
+                out = "[ax%d]" % i
+                # Equal-power curves; a linear crossfade dips in the middle on
+                # uncorrelated material.
+                parts.append("%s[a%d]acrossfade=d=%.3f:c1=qsin:c2=qsin%s"
+                             % (acur, i, a_cross, out))
+                acur = out
 
     out_path = make_output(srcs[0], "smooth", a.get("output"), ".mp4")
     script = os.path.join(os.path.dirname(out_path), ".xfade_%d.txt" % os.getpid())
@@ -8021,6 +8054,23 @@ TOOLS = [
             "paths": {"type": "array", "items": {"type": "string"}, "description": "Clips in play order."},
             "transition": {"type": "string", "enum": TRANSITIONS, "description": "Default 'fade' (dissolve)."},
             "duration": {"type": "number", "description": "Transition length in seconds. Default 0.5."},
+            "audio_crossfade": {"type": "number",
+                                "description": "Cross the sound over a longer window than the "
+                                               "picture. Symmetric."},
+            "audio_lead": {"type": "number",
+                           "description": "Seconds the sound cuts BEFORE the picture. Positive "
+                                          "makes a J-cut - you hear the next shot before you "
+                                          "see it. Negative makes an L-cut - the last shot's "
+                                          "sound runs on under the new picture. 0.2 to 0.5 is "
+                                          "the usual range; it is the commonest move in "
+                                          "dialogue editing."},
+            "junctions": {"type": "array",
+                          "description": "Per-join overrides, one per cut: "
+                                         "{transition, duration, audio_lead}.",
+                          "items": {"type": "object", "properties": {
+                              "transition": {"type": "string", "enum": TRANSITIONS},
+                              "duration": {"type": "number"},
+                              "audio_lead": {"type": "number"}}}},
             "aspect": {"type": "string", "enum": list(ASPECTS)},
             "fps": {"type": "integer"},
             "output": {"type": "string"}},
