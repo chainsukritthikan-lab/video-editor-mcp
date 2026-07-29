@@ -3029,27 +3029,53 @@ def _render_kinetic(a, src, payload, w, h, fps, total, font, npx, n_words, detec
     props_file = os.path.join(tmp, "kprops_%d.json" % os.getpid())
     with io.open(props_file, "w", encoding="utf-8") as fh:
         fh.write(json.dumps(props, ensure_ascii=False))
-    overlay = os.path.join(tmp, "kinetic_%d.webm" % os.getpid())
-    cmd = [npx, "remotion", "render", "KineticCaptions", overlay,
-           "--codec=vp8", "--pixel-format=yuva420p",
-           "--props=%s" % props_file, "--log=error"]
-    try:
-        p = subprocess.run(cmd, cwd=MOTION_DIR, stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE, timeout=3600,
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    except subprocess.TimeoutExpired:
-        raise ToolError("The caption render timed out.")
-    if p.returncode != 0 or not os.path.isfile(overlay):
-        tail = (p.stderr or b"").decode("utf-8", "replace").strip().splitlines()[-6:]
-        raise ToolError("Remotion failed:\n" + "\n".join(tail))
+
+    # Render only the stretches that actually HAVE a caption. Measured on this
+    # machine, a Remotion invocation costs 10.3s fixed plus 0.242s per frame, so a
+    # gap is worth skipping once it is longer than the startup it would cost to
+    # skip it - about 43 frames. On a typical ad captions cover around half the
+    # running time, which took the render from 191s to 133s without touching
+    # quality, and does LESS total work rather than simply using more of the CPU.
+    startup_frames = 43
+    runs = []
+    for cue in sorted(payload, key=lambda c: c["s"]):
+        lo = max(0, int(math.floor(cue["s"] * fps)) - 1)
+        hi = min(frames - 1, int(math.ceil(cue["e"] * fps)) + 1)
+        if runs and lo - runs[-1][1] <= startup_frames:
+            runs[-1][1] = max(runs[-1][1], hi)
+        else:
+            runs.append([lo, hi])
+
+    segments = []
+    for i, (lo, hi) in enumerate(runs):
+        seg = os.path.join(tmp, "kin_%d_%d.webm" % (os.getpid(), i))
+        cmd = [npx, "remotion", "render", "KineticCaptions", seg,
+               "--codec=vp8", "--pixel-format=yuva420p",
+               "--props=%s" % props_file, "--frames=%d-%d" % (lo, hi), "--log=error"]
+        try:
+            p = subprocess.run(cmd, cwd=MOTION_DIR, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, timeout=3600,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except subprocess.TimeoutExpired:
+            raise ToolError("The caption render timed out.")
+        if p.returncode != 0 or not os.path.isfile(seg):
+            tail = (p.stderr or b"").decode("utf-8", "replace").strip().splitlines()[-6:]
+            raise ToolError("Remotion failed:\n" + "\n".join(tail))
+        segments.append((seg, lo / float(fps)))
 
     out = make_output(src, "kinetic", a.get("output"), ".mp4")
-    # libvpx by name: VP8 alpha lives in a separate WebM layer the default decoder drops.
-    ffmpeg_run(["-i", src, "-c:v", "libvpx", "-i", overlay,
-                "-filter_complex", "[0:v][1:v]overlay=0:0:eof_action=pass",
-                "-map", "0:a?", "-c:a", "copy"] + VIDEO_ENC +
+    # libvpx by name: VP8 alpha lives in a separate WebM layer the default decoder
+    # drops. itsoffset puts each rendered stretch back at the time it belongs to.
+    args, chain, last = ["-i", src], [], "[0:v]"
+    for i, (seg, at) in enumerate(segments, 1):
+        args += ["-c:v", "libvpx", "-itsoffset", "%.3f" % at, "-i", seg]
+        label = "[v%d]" % i if i < len(segments) else "[outv]"
+        chain.append("%s[%d:v]overlay=0:0:eof_action=pass%s" % (last, i, label))
+        last = label
+    ffmpeg_run(args + ["-filter_complex", ";".join(chain), "-map", "[outv]",
+                       "-map", "0:a?", "-c:a", "copy"] + VIDEO_ENC +
                ["-movflags", "+faststart", out])
-    for f in (overlay, props_file):
+    for f in [props_file] + [s for s, _t in segments]:
         try:
             os.remove(f)
         except OSError:
