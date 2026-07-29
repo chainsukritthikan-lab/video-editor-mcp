@@ -2647,6 +2647,43 @@ def _word_timings(src, lang, size, want_map=False):
     return out, detected
 
 
+def _joined_speech_map(srcs, offsets, lang, size):
+    """One character-to-time map across pieces that are about to be joined.
+
+    Cues are written against the finished cut, so the map they are looked up in has
+    to run on the finished cut's clock. The joined audio does not exist yet, so each
+    piece is recognised on its own and its times are shifted by where that piece
+    lands on the timeline.
+
+    Worth the recognition pass: spreading a cue by character count instead put the
+    word highlight an average of 0.31s and a worst of 0.75s off the voice on the
+    MiiMuuD ad - 43 of its 45 words more than a frame out. Recognition is cached, so
+    the cost falls on the first build of a set of pieces and no later one.
+    """
+    fulls, maps, bases, at = [], [], [], 0
+    for s in srcs:
+        try:
+            full_i, time_i = _word_timings(s, lang, size, want_map=True)
+        except ToolError:
+            full_i, time_i = "", None       # a silent shot is perfectly normal
+        fulls.append(full_i)
+        maps.append(time_i)
+        bases.append(at)
+        at += len(full_i)
+
+    if not any(fulls):
+        return None
+
+    def time_at(idx, end=False):
+        for i in range(len(fulls) - 1, -1, -1):
+            if fulls[i] and idx >= bases[i]:
+                return offsets[i] + maps[i](idx - bases[i], end)
+        first = next(i for i, f in enumerate(fulls) if f)
+        return offsets[first] + maps[first](0, end)
+
+    return "".join(fulls), time_at
+
+
 def _room_tone_source(src, min_len=0.45):
     """Find the quietest sustained stretch - that is what the room actually sounds like."""
     total = duration_of(src)
@@ -6331,26 +6368,14 @@ def t_build(a):
     elif a.get("desaturate"):
         vchain.append("eq=saturation=%.3f" % float(a["desaturate"]))
 
-    cues = a.get("captions")
-    ass_name = None
-    if cues:
-        payload = _cues_from_text(cues, total, None)
-        if payload:
-            font = a.get("font") or "Tahoma"
-            ass_name = "build_%d.ass" % os.getpid()
-            with io.open(os.path.join(tmp, ass_name), "w", encoding="utf-8-sig") as fh:
-                fh.write(_kinetic_ass_text(a, payload, w, h, font))
-            vchain.append("subtitles=%s" % ass_name)
-
-    parts.append("%s%s[outv]" % (cur, ",".join(vchain) if vchain else "null"))
-    n_vparts = len(parts)   # everything after this point is audio, and the loudness
-                            # measurement runs on THAT alone - see run(measure_only)
-
     # --- sound: J/L cuts, effects, music --------------------------------------
+    # Built before the captions, because the captions need to hear it: the word
+    # highlight is locked to the voice on the JOINED dialogue.
+    aparts = []
     acur = None
     if has_snd:
         for i in range(len(srcs)):
-            parts.append("[%d:a]aresample=48000,asetpts=N/SR/TB[a%d]" % (i, i))
+            aparts.append("[%d:a]aresample=48000,asetpts=N/SR/TB[a%d]" % (i, i))
         if abs(lead) > 0.01:
             mixed = []
             for i in range(len(srcs)):
@@ -6358,19 +6383,20 @@ def t_build(a):
                 head_f = "afade=t=in:st=0:d=%.3f," % a_cross if i else ""
                 tail_f = ("afade=t=out:st=%.3f:d=%.3f," %
                           (max(0.0, durs[i] - a_cross), a_cross)) if i < len(srcs) - 1 else ""
-                parts.append("[a%d]%s%sadelay=%d|%d[am%d]"
+                aparts.append("[a%d]%s%sadelay=%d|%d[am%d]"
                              % (i, head_f, tail_f, int(start * 1000), int(start * 1000), i))
                 mixed.append("[am%d]" % i)
-            parts.append("%samix=inputs=%d:duration=longest:normalize=0[abase]"
+            aparts.append("%samix=inputs=%d:duration=longest:normalize=0[abase]"
                          % ("".join(mixed), len(mixed)))
         else:
             acur = "[a0]"
             for i in range(1, len(srcs)):
-                parts.append("%s[a%d]acrossfade=d=%.3f:c1=qsin:c2=qsin[ax%d]"
+                aparts.append("%s[a%d]acrossfade=d=%.3f:c1=qsin:c2=qsin[ax%d]"
                              % (acur, i, a_cross, i))
                 acur = "[ax%d]" % i
-            parts.append("%sanull[abase]" % acur)
+            aparts.append("%sanull[abase]" % acur)
         acur = "[abase]"
+        n_dlg = len(aparts)     # the dialogue alone, before effects and music
 
         n_in = len(srcs)
         sfx = a.get("sfx") or []
@@ -6396,11 +6422,11 @@ def t_build(a):
                 wav = os.path.join(tmp, "bsfx_%d_%d.wav" % (os.getpid(), k))
                 render_sfx(name, wav, gain)
                 extra_inputs.append(wav)
-                parts.append("[%d:a]adelay=%d|%d[sx%d]"
+                aparts.append("[%d:a]adelay=%d|%d[sx%d]"
                              % (n_in + len(extra_inputs) - 1, int(at * 1000),
                                 int(at * 1000), k))
                 lay.append("[sx%d]" % k)
-            parts.append("%s%samix=inputs=%d:duration=first:normalize=0[awsfx]"
+            aparts.append("%s%samix=inputs=%d:duration=first:normalize=0[awsfx]"
                          % (acur, "".join(lay), len(lay) + 1))
             acur = "[awsfx]"
 
@@ -6409,10 +6435,58 @@ def t_build(a):
             mp = check_input(music, "music")
             extra_inputs.append(mp)
             idx = n_in + len(extra_inputs) - 1
-            parts.append("[%d:a]aloop=loop=-1:size=2e9,volume=%.3f[bed]"
+            aparts.append("[%d:a]aloop=loop=-1:size=2e9,volume=%.3f[bed]"
                          % (idx, float(a.get("music_volume", 0.22))))
-            parts.append("%s[bed]amix=inputs=2:duration=first:normalize=0[awm]" % acur)
+            aparts.append("%s[bed]amix=inputs=2:duration=first:normalize=0[awm]" % acur)
             acur = "[awm]"
+
+    # --- captions, timed against the joined dialogue --------------------------
+    cues = a.get("captions")
+    ass_name = None
+    speech_note = ""
+    if cues:
+        # The glow has to land on the word as it is said. Spreading a cue by character
+        # count instead put it an average of 0.31s and a worst of 0.75s off on the
+        # MiiMuuD ad - 43 of 45 words more than a frame out.
+        #
+        # Recognise the JOINED dialogue, once. Recognising the pieces separately is
+        # correct but far slower: whisper's per-call overhead dominates a 2-second
+        # shot, and seven of them took 160s against 45s for the join.
+        timer = None
+        if has_snd and a.get("speech_timing", True):
+            dlg = os.path.join(tmp, "build_dlg_%d.wav" % os.getpid())
+            args = []
+            for s_ in srcs:
+                args += ["-i", os.path.abspath(s_)]
+            script = os.path.join(tmp, "build_dlg_%d.txt" % os.getpid())
+            with io.open(script, "w", encoding="utf-8") as fh:
+                fh.write(";".join(aparts[:n_dlg]))
+            p_dlg = subprocess.run(
+                ["ffmpeg", "-y", "-v", "error"] + args +
+                ["-filter_complex_script", script, "-map", "[abase]",
+                 "-ac", "1", "-ar", "16000", dlg],
+                cwd=tmp, capture_output=True, text=True)
+            if p_dlg.returncode == 0 and os.path.isfile(dlg):
+                try:
+                    timer = _word_timings(dlg, a.get("language") or "auto",
+                                          a.get("model") or "large-v3", want_map=True)
+                except ToolError:
+                    speech_note = ("\n  No speech found, so the highlight is spaced by "
+                                   "letter count rather than sitting on the words.")
+        elif not a.get("speech_timing", True):
+            speech_note = ("\n  speech_timing off: the highlight is spaced by letter "
+                           "count, about a third of a second off the voice. Drafts only.")
+        payload = _cues_from_text(cues, total, timer)
+        if payload:
+            font = a.get("font") or "Tahoma"
+            ass_name = "build_%d.ass" % os.getpid()
+            with io.open(os.path.join(tmp, ass_name), "w", encoding="utf-8-sig") as fh:
+                fh.write(_kinetic_ass_text(a, payload, w, h, font))
+            vchain.append("subtitles=%s" % ass_name)
+
+    parts.append("%s%s[outv]" % (cur, ",".join(vchain) if vchain else "null"))
+    n_vparts = len(parts)   # everything after this is audio, and the loudness
+    parts += aparts         # measurement runs on THAT alone - see run(measure_only)
 
     out = make_output(srcs[0], "build", a.get("output"), ".mp4")
 
@@ -6488,8 +6562,9 @@ def t_build(a):
         bits.append("%d effect(s)" % len(a["sfx"]))
     if a.get("music"):
         bits.append("music under")
-    return done(out, "Built in ONE pass: %s.%s\n  %.2fs at %dx%d."
-                % (", ".join(bits), note, video_duration_of(out), w, h))
+    return done(out, "Built in ONE pass: %s.%s%s\n  %.2fs at %dx%d."
+                % (", ".join(bits), note, speech_note,
+                   video_duration_of(out), w, h))
 
 
 # ---------------------------------------------------------------- listening
@@ -7167,6 +7242,12 @@ TOOLS = [
                                "enum": ["blue", "cyan", "red", "green", "yellow", "magenta"],
                                "description": "Pulled back everywhere else so it stands out."},
             "product_lift": {"type": "number"},
+            "speech_timing": {"type": "boolean",
+                              "description": "Default true: recognise the speech so each word "
+                                             "lights exactly as it is said. Turning it off is "
+                                             "quicker but puts the highlight about a third of a "
+                                             "second off the voice - drafts only. Recognition is "
+                                             "cached, so only the first build pays for it."},
             "captions": {"type": "array",
                          "description": "[{start, end, text}] with newlines for line breaks - "
                                         "same shape kinetic_captions takes.",
