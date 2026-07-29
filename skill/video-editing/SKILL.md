@@ -5,7 +5,7 @@ description: Editing video with the local video-editor connector - cutting an ad
 
 # Editing video with the local connector
 
-The connector has 77 tools and no taste. It measures; it cannot judge. The value
+The connector has 83 tools and no taste. It measures; it cannot judge. The value
 you add is the judging, so spend the time there and let the tools do the rest.
 
 ## Always, in this order
@@ -21,13 +21,30 @@ you add is the judging, so spend the time there and let the tools do the rest.
    reveal or a visual joke. Name those in `protect_shots` and they survive
    whatever they score. The opening and closing shots are already safe: an
    advert ends on the product.
-4. **Render in this order.** Cut → `video_fix_audio` → `video_add_sfx` →
-   music → `video_polish` → `video_fix_audio` again → captions.
-   The second loudness pass is not redundant: music, effects and the polish
-   pass all add level, and the peaks only clip once they are stacked.
-4b. **Captions: use `engine: "fast"`.** It draws the colour, the lift AND the halo
-   with libass in one pass, about four times quicker than the browser renderer for
-   the same look. `remotion` remains only for changes ASS cannot express.
+4. **Finish with `video_build`, not a chain of tools.** Trim the pieces first
+   (several at once - they are independent), then hand the list to `video_build`.
+   It joins with J/L cuts, grades, burns the captions, lays in the effects and
+   music, and levels the mix in a **single pass** over the footage. The same ad
+   took **148s** through the old chain and **39s** through `video_build`, picture
+   identical and -14 LUFS either way.
+
+   The old chain - `video_join_smooth` → `video_fix_audio` → `video_add_sfx` →
+   music → `video_polish` → `video_fix_audio` → captions - is still there for a
+   one-off change, but each of those stages decodes the whole cut, encodes it
+   again and writes twenty-odd megabytes the next stage immediately reads back.
+   Doing it once is most of the win.
+
+   Two rules survive from the old order and are built into `video_build`:
+   **measure the loudness before correcting it** (single-pass loudnorm drifts a
+   dB, and the measurement must run on the audio graph ALONE - carry the picture
+   into it and ffmpeg refuses the command, the parse fails, and it silently falls
+   back to the drifting version), and **pass `offset` from the measurement**
+   (leaving it out landed a finished ad at -15.06 against a -14.0 target).
+
+4b. **Standalone captions: use `engine: "fast"`.** It draws the colour, the lift
+   AND the halo with libass in one pass, about four times quicker than the browser
+   renderer for the same look. `remotion` remains only for changes ASS cannot
+   express. `video_build` already uses the libass path.
 
 5. **Review before delivering.** `video_review` with the .srt you burned, then
    `sound_faults`, then `video_check`. Three different questions: does the
