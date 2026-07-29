@@ -3060,9 +3060,9 @@ def _render_kinetic(a, src, payload, w, h, fps, total, font, npx, n_words, detec
         out = make_output(src, "kinetic", a.get("output"), ".mp4")
         n = _render_kinetic_ass(a, src, payload, w, h, total, font, out)
         return done(out, "Kinetic captions: %d word(s) in %s across %d cue(s), each lighting "
-                         "up as it is spoken.\n  Drawn by libass in %d step(s) - no browser "
-                         "render, so about ten times quicker, at the cost of the soft glow "
-                         "around the live word.\n  First cue: %s"
+                         "up as it is spoken, with a halo on the live word.\n  Drawn by "
+                         "libass in %d step(s) - no browser render, so roughly four times "
+                         "quicker than 'remotion' for the same look.\n  First cue: %s"
                     % (n_words, detected, len(payload), n, preview))
 
     frames = max(fps, int(round(total * fps)))
@@ -7990,11 +7990,12 @@ TOOLS = [
                      "description": "Halo around the live word, engine 'fast' only. "
                                     "1 is the default, 0 turns it off."},
             "engine": {"type": "string", "enum": ["remotion", "fast"],
-                       "description": "'remotion' (default) renders every frame through a "
-                                      "browser: adds a soft glow around the live word, but "
-                                      "takes minutes. 'fast' draws the same colour-and-scale "
-                                      "highlight with libass in a single pass - roughly ten "
-                                      "times quicker, no glow, and no panel background."},
+                       "description": "'fast' draws everything - colour, lift and halo - with "
+                                      "libass in one pass, about four times quicker, and is "
+                                      "what you usually want. 'remotion' (default, for "
+                                      "compatibility) renders every frame through a browser; "
+                                      "reach for it only if you need the React component "
+                                      "changed in ways ASS cannot express."},
             "accent": {"type": "string", "description": "Colour of the word being spoken."},
             "text_color": {"type": "string"},
             "panel": {"type": "string", "description": "CSS colour behind the text."},

@@ -25,6 +25,10 @@ you add is the judging, so spend the time there and let the tools do the rest.
    music → `video_polish` → `video_fix_audio` again → captions.
    The second loudness pass is not redundant: music, effects and the polish
    pass all add level, and the peaks only clip once they are stacked.
+4b. **Captions: use `engine: "fast"`.** It draws the colour, the lift AND the halo
+   with libass in one pass, about four times quicker than the browser renderer for
+   the same look. `remotion` remains only for changes ASS cannot express.
+
 5. **Review before delivering.** `video_review` with the .srt you burned, then
    `sound_faults`, then `video_check`. Three different questions: does the
    picture read, does the mix have a fault, are the numbers right. Look at the
@@ -49,6 +53,22 @@ read off the font. Nine are text faces; **TH Charm of AU, TH Charmonman and TH
 Srisakdi are display faces** - titles and end cards, never running captions.
 Never invent a `fits` figure: deriving it from metrics once gave TH Krub 24
 characters when it really fits 20, and captions ran off both edges.
+
+## Cut the sound somewhere other than the picture
+
+The single move that most separates edited footage from footage stuck together.
+`video_join_smooth` takes `audio_lead`, globally or per junction:
+
+- **positive = J-cut** - you hear the next shot before you see it. Use it going
+  INTO a line, so the cut feels motivated rather than arbitrary.
+- **negative = L-cut** - the last shot's sound runs on under the new picture.
+  Use it coming OUT of a reaction, or to hold a room alive across a cut.
+
+0.2 to 0.5 seconds is the usual range. Verified exact: a 0.60s J-cut puts the
+sound 0.63s ahead of the picture. Under about 0.15s nobody notices; past about
+0.8s it reads as a sync fault.
+
+Straight cuts on every join are the giveaway of an unedited timeline.
 
 ## Sound
 
