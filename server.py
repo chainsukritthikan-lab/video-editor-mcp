@@ -2957,6 +2957,8 @@ def _render_kinetic_ass(a, src, payload, w, h, total, font, out):
         m_, s_ = divmod(rem, 60)
         return "%d:%02d:%05.2f" % (int(h_), int(m_), s_)
 
+    glow = float(a.get("glow", 1.0))
+
     events = []
     for cue in payload:
         flat = [wd for ln in cue["lines"] for wd in ln]
@@ -2965,19 +2967,36 @@ def _render_kinetic_ass(a, src, payload, w, h, total, font, out):
             end = flat[i + 1]["s"] if i + 1 < len(flat) else cue["e"]
             if end <= start:
                 continue
-            parts, k = [], 0
-            for li, ln in enumerate(cue["lines"]):
-                if li:
-                    parts.append("\\N")
-                for wd in ln:
-                    if k == i:
-                        # \fscx/\fscy is the lift; \r drops back to the style defaults
-                        parts.append("{\\c%s\\fscx109\\fscy109}%s{\\r}" % (accent, wd["t"]))
-                    else:
-                        parts.append(wd["t"])
-                    k += 1
-            events.append("Dialogue: 0,%s,%s,K,,0,0,0,,%s"
-                          % (ts(start), ts(end), "".join(parts)))
+
+            def line_for(live_tags, other_tags):
+                """The whole cue, so libass lays it out identically every time."""
+                parts, k = [], 0
+                for li, ln in enumerate(cue["lines"]):
+                    if li:
+                        parts.append("\\N")
+                    for wd in ln:
+                        parts.append("{%s}%s{\\r}"
+                                     % (live_tags if k == i else other_tags, wd["t"]))
+                        k += 1
+                return "".join(parts)
+
+            if glow > 0.01:
+                # The halo: the SAME cue, every word but the live one made fully
+                # transparent, the live one blown out in the accent colour and blurred.
+                # Rendering the whole line rather than the word alone is what keeps the
+                # halo registered with the text - libass centres each line it is given,
+                # so a lone word would sit in the middle of the frame.
+                events.append(
+                    "Dialogue: 0,%s,%s,K,,0,0,0,,%s"
+                    % (ts(start), ts(end),
+                       line_for("\\c%s\\3c%s\\bord%d\\blur%d\\fscx109\\fscy109\\alpha&H30&"
+                                % (accent, accent, max(2, int(size * 0.10)),
+                                   max(2, int(size * 0.13 * glow))),
+                                "\\alpha&HFF&\\3a&HFF&\\4a&HFF&")))
+            # the text itself, over the halo
+            events.append("Dialogue: 1,%s,%s,K,,0,0,0,,%s"
+                          % (ts(start), ts(end),
+                             line_for("\\c%s\\fscx109\\fscy109" % accent, "")))
 
     tmp = _tmpdir()
     ass = os.path.join(tmp, "kin_%d.ass" % os.getpid())
@@ -7934,6 +7953,9 @@ TOOLS = [
             "outline": {"type": "number",
                         "description": "Black stroke around each word, as a share of the font "
                                        "size. Default 0.075. Needed when 'panel' is transparent."},
+            "glow": {"type": "number",
+                     "description": "Halo around the live word, engine 'fast' only. "
+                                    "1 is the default, 0 turns it off."},
             "engine": {"type": "string", "enum": ["remotion", "fast"],
                        "description": "'remotion' (default) renders every frame through a "
                                       "browser: adds a soft glow around the live word, but "
