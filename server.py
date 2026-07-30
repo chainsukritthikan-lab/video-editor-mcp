@@ -18,6 +18,7 @@ import time
 import os
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 import glob as globmod
@@ -5933,6 +5934,39 @@ def _kb_filter(i, dur, cw, ch, fps):
             % (cw * 2, ch * 2, cw * 2, ch * 2, z, fr, tilt, fr, cw, ch, fps))
 
 
+def _look_filter(warmth, vignette, contrast):
+    """A look, rather than a saturation number.
+
+    Three small things, none of them noticeable on its own, which together are
+    most of what separates a graded film from an ungraded one:
+
+      WARMTH    a touch of red in the highlights and blue out of the shadows. A
+                room lit by tungsten and a phone's auto white balance fight each
+                other; nudging everything the same way settles it.
+      CONTRAST  an S-curve, not a level change. Deepens the shadows and opens the
+                highlights while leaving skin - which lives in the middle - alone.
+                A straight contrast lift takes the faces with it.
+      VIGNETTE  barely there. The eye goes to the brightest part of the frame, so
+                darkening the corners by a few percent points it at the faces
+                without anyone noticing it has been done. Measured hard limit:
+                past about PI/9 it crushes an already-dark foreground into what
+                reads as a black bar.
+    """
+    parts = []
+    if abs(contrast) > 0.005:
+        c = max(-0.35, min(0.35, contrast))
+        parts.append("curves=all='0/0 %.3f/%.3f %.3f/%.3f 1/1'"
+                     % (0.25, 0.25 - c * 0.16, 0.75, 0.75 + c * 0.16))
+    if abs(warmth) > 0.005:
+        w = max(-1.0, min(1.0, warmth))
+        parts.append("colorbalance=rs=%.3f:gs=%.3f:bs=%.3f:rh=%.3f:bh=%.3f"
+                     % (-0.03 * w, -0.01 * w, 0.045 * w, 0.05 * w, -0.035 * w))
+    if vignette > 0.005:
+        v = max(0.0, min(1.0, vignette))
+        parts.append("vignette=angle=PI/%.2f:mode=forward" % (14.0 - 5.0 * v))
+    return ",".join(parts)
+
+
 def _panel_filter(cw, ch, fps):
     """A clip of the wrong shape, in its own panel over a blur of itself.
 
@@ -6018,8 +6052,22 @@ def t_montage(a):
     lift("finish_with", False)
 
     clips = [check_input(c, "clip") for c in (a.get("clips") or [])]
-    per = float(a.get("seconds_each", 2.4))
-    hold = float(a.get("hold_last", per * 1.9))
+    # seconds_each takes a LIST as readily as a number, because an even hold on
+    # every photo is the thing that most makes a montage feel machine-made. A
+    # person lingers on the picture that matters and moves through the ones that
+    # are only there for completeness, and gives the payoff twice the room.
+    _se = a.get("seconds_each", 2.4)
+    if isinstance(_se, (list, tuple)):
+        if len(_se) != len(photos):
+            raise ToolError("seconds_each has %d entries for %d photos - give one "
+                            "number, or exactly one per photo in play order."
+                            % (len(_se), len(photos)))
+        per_list = [max(0.4, float(x)) for x in _se]
+        per = statistics.fmean(per_list)
+    else:
+        per = float(_se)
+        per_list = None
+    hold = float(a.get("hold_last", (per_list[-1] if per_list else per * 1.9)))
     xf = float(a.get("transition_seconds", 0.45))
     fps = int(a.get("fps") or 30)
 
@@ -6045,6 +6093,9 @@ def t_montage(a):
     tmp = _tmpdir()
     tag = os.getpid()
 
+    look = _look_filter(float(a.get("warmth", 0.0)),
+                        float(a.get("vignette", 0.0)),
+                        float(a.get("contrast", 0.0)))
     gammas, exp_med, exp_spread = ({}, 0.0, 0.0)
     if a.get("match_exposure", True):
         gammas, exp_med, exp_spread = _exposure_match(
@@ -6056,6 +6107,8 @@ def t_montage(a):
         vf = _kb_filter(i, dur, cw, ch, fps)
         if path in gammas:
             vf = "eq=gamma=%.4f," % gammas[path] + vf
+        if look:
+            vf = vf + "," + look
         subprocess.run(
             ["ffmpeg", "-y", "-v", "error", "-loop", "1", "-r", str(fps),
              "-i", os.path.abspath(path),
@@ -6069,9 +6122,13 @@ def t_montage(a):
     def moment(spec):
         k, src, a0, b0 = spec
         out = os.path.join(tmp, "mg_c%d_%03d.mp4" % (tag, k))
+        pf = _panel_filter(cw, ch, fps)
+        if look:
+            pf = pf.replace(",setsar=1,fps=%d[v]" % fps,
+                            "," + look + ",setsar=1,fps=%d[v]" % fps)
         args = ["ffmpeg", "-y", "-v", "error", "-ss", "%.3f" % a0,
                 "-i", os.path.abspath(src), "-t", "%.3f" % (b0 - a0),
-                "-filter_complex", _panel_filter(cw, ch, fps), "-map", "[v]"]
+                "-filter_complex", pf, "-map", "[v]"]
         args += (["-map", "0:a"] if has_audio(src) else
                  ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-map", "1:a",
                   "-shortest"])
@@ -6097,9 +6154,14 @@ def t_montage(a):
     twins = (_near_twins(photos, float(a.get("twin_limit", 18.0)))
              if a.get("shorten_repeats", True) else set())
     twin_hold = per * float(a.get("repeat_scale", 0.55))
-    jobs = [(i, p, hold if i == len(photos) - 1
-             else twin_hold if i in twins else per)
-            for i, p in enumerate(photos)]
+    def dur_of(i):
+        if per_list:                       # an explicit plan always wins
+            return per_list[i]
+        if i == len(photos) - 1:
+            return hold
+        return twin_hold if i in twins else per
+
+    jobs = [(i, p, dur_of(i)) for i, p in enumerate(photos)]
     workers = max(2, min(4, (os.cpu_count() or 4) // 3))
     with ThreadPoolExecutor(max_workers=workers) as ex:
         stills = list(ex.map(still, jobs))
@@ -6109,8 +6171,8 @@ def t_montage(a):
 
     pieces = head_f + stills[:-1] + tail_f + stills[-1:]
     lens = ([b - x for _, x, b in heads] +
-            [twin_hold if i in twins else per for i in range(len(stills) - 1)] +
-            [b - x for _, x, b in tails] + [hold])
+            [dur_of(i) for i in range(len(stills) - 1)] +
+            [b - x for _, x, b in tails] + [dur_of(len(photos) - 1)])
 
     at, marks = 0.0, []
     for d in lens:
@@ -6182,7 +6244,11 @@ def t_montage(a):
     msg = t_build(build)
 
     extra = ["%d photo(s) in %s" % (len(photos), order_said)]
-    if twins:
+    if per_list:
+        extra.append("pacing given per photo, %.1fs to %.1fs - the holds are not even, "
+                     "which is what stops it reading as a slideshow"
+                     % (min(per_list), max(per_list)))
+    if twins and not per_list:
         extra.append("%d near-repeat(s) held %.1fs instead of %.1fs so the pair reads "
                      "as one beat rather than a stutter" % (len(twins), twin_hold, per))
     if gammas:
@@ -8008,7 +8074,14 @@ TOOLS = [
                 "shape": {"enum": ["auto", "4:5", "9:16", "1:1", "3:4", "16:9"],
                           "description": "Default auto: follows whichever way most of the "
                                          "photos face."},
-                "seconds_each": {"type": "number", "description": "Per photo, default 2.4."},
+                "seconds_each": {"description": "Seconds per photo. ONE number for an even "
+                                                "montage, or a LIST with one entry per photo "
+                                                "in play order - linger on what matters, move "
+                                                "through the rest. Uneven holds are most of "
+                                                "what separates an edit from a slideshow. "
+                                                "Default 2.4.",
+                                 "oneOf": [{"type": "number"},
+                                           {"type": "array", "items": {"type": "number"}}]},
                 "match_exposure": {"type": "boolean",
                                    "description": "Default true: pulls each photo's "
                                                   "exposure toward the middle of the set so "
@@ -8053,6 +8126,17 @@ TOOLS = [
                 "outline": {"type": "number"}, "glow": {"type": "number"},
                 "margin_bottom": {"type": "number"},
                 "grain": {"type": "number"}, "saturation": {"type": "number"},
+                "warmth": {"type": "number",
+                           "description": "-1 to 1. Red into the highlights, blue out of "
+                                          "the shadows. 0.35 settles mixed indoor light."},
+                "contrast": {"type": "number",
+                             "description": "-0.35 to 0.35. An S-curve, so it deepens the "
+                                            "shadows without dragging faces with it. 0.18 "
+                                            "is a gentle film contrast."},
+                "vignette": {"type": "number",
+                             "description": "0 to 1, barely-there by design. Darkens the "
+                                            "corners so the eye goes to the faces. 0.4 is "
+                                            "invisible and effective; 1.0 is too much."},
                 "transition": {"type": "string"}, "fps": {"type": "integer"},
                 "target_lufs": {"type": "number"}, "true_peak": {"type": "number"},
                 "output": {"type": "string"}},
