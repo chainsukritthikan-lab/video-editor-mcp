@@ -1527,9 +1527,40 @@ def _loudnorm_filter(src, target, tp, denoise):
     return pre + base + measured
 
 
-TRANSITIONS = ["fade", "fadeblack", "fadewhite", "dissolve", "smoothleft", "smoothright",
-               "smoothup", "smoothdown", "wipeleft", "wiperight", "slideleft", "slideright",
-               "circleopen", "circleclose", "radial", "pixelize", "hblur"]
+# All 58 that this ffmpeg's xfade actually offers. The registry used to list
+# seventeen, so forty-one perfectly good ones were simply invisible.
+TRANSITIONS = [
+    "fade", "fadefast", "fadeslow", "fadeblack", "fadewhite", "fadegrays", "dissolve",
+    "distance", "pixelize", "hblur", "radial", "zoomin",
+    "wipeleft", "wiperight", "wipeup", "wipedown",
+    "wipetl", "wipetr", "wipebl", "wipebr",
+    "slideleft", "slideright", "slideup", "slidedown",
+    "smoothleft", "smoothright", "smoothup", "smoothdown",
+    "circlecrop", "rectcrop", "circleopen", "circleclose",
+    "vertopen", "vertclose", "horzopen", "horzclose",
+    "diagtl", "diagtr", "diagbl", "diagbr",
+    "hlslice", "hrslice", "vuslice", "vdslice",
+    "squeezeh", "squeezev",
+    "hlwind", "hrwind", "vuwind", "vdwind",
+    "coverleft", "coverright", "coverup", "coverdown",
+    "revealleft", "revealright", "revealup", "revealdown",
+]
+
+# A dissolve on every single join is the giveaway of an unedited timeline, and it
+# is what this connector did on every film it has made. The rule an editor
+# actually follows is about what the two shots ARE, not about picking a prettier
+# wipe: a change WITHIN a moment is a hard cut, and a change of moment gets a
+# dissolve. So "auto" decides per join from how alike the two frames are, using
+# the same 16x16 grey signature the near-repeat check uses.
+#
+# Thresholds measured on a real album of twenty-one photographs: adjacent pairs
+# scored 7.7 (the same shot twice) up to 87, median 53.
+TRANSITION_RULES = [
+    (22.0, "cut",     "same moment - a hard cut, because a dissolve here looks like a mistake"),
+    (40.0, "fadefast", "same place, different beat - a quick fade"),
+    (68.0, "fade",     "a new moment - an ordinary dissolve"),
+    (999.0, "smoothup", "a real change of place - let it move"),
+]
 
 
 def t_join_smooth(a):
@@ -6293,6 +6324,32 @@ def _loud_windows(src, want, length, gap=4.0):
     return sorted(picks) or [(0.0, min(length, total))]
 
 
+def _sig_distances(photos):
+    """How alike each photo is to the one before it. 0 = identical.
+
+    The same 16x16 grey signature the near-repeat check uses. Measured on a real
+    album of twenty-one: adjacent pairs ran 7.7 (the same shot twice) to 87, with
+    a median of 53.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return []
+    sigs = []
+    for p in photos:
+        try:
+            with Image.open(p) as im:
+                sigs.append(list(im.convert("L").resize((16, 16), Image.LANCZOS).getdata()))
+        except Exception:
+            sigs.append(None)
+    out = []
+    for i in range(1, len(sigs)):
+        a_, b_ = sigs[i - 1], sigs[i]
+        out.append(None if not a_ or not b_ else
+                   sum(abs(x - y) for x, y in zip(a_, b_)) / float(len(a_)))
+    return out
+
+
 def _near_twins(photos, limit=18.0):
     """Which neighbours are so alike that holding both reads as a stutter?
 
@@ -6681,6 +6738,30 @@ def t_montage(a):
         else:
             heads.append((src, 0.0, min(clip_len, video_duration_of(src))))
 
+    # A transition per join, decided by what the two shots ARE. Passing one name
+    # applies it everywhere, which is what every film this made used to do.
+    want_tr = a.get("transition")
+    trans_plan, trans_why = None, ""
+    if want_tr in (None, "auto"):
+        d_list = _sig_distances(photos)
+        if d_list:
+            picks = []
+            for d in d_list:
+                if d is None:
+                    picks.append("fade")
+                    continue
+                for limit, name, _why in TRANSITION_RULES:
+                    if d < limit:
+                        picks.append(name)
+                        break
+            from collections import Counter
+            c = Counter(picks)
+            trans_plan = picks
+            trans_why = ("transitions chosen per cut from how alike the two shots are: "
+                         + ", ".join("%d x %s" % (n, k) for k, n in c.most_common()))
+    elif isinstance(want_tr, (list, tuple)):
+        trans_plan = [str(x) for x in want_tr]
+
     twins = (_near_twins(photos, float(a.get("twin_limit", 18.0)))
              if a.get("shorten_repeats", True) else set())
     twin_hold = per * float(a.get("repeat_scale", 0.55))
@@ -6897,7 +6978,24 @@ def t_montage(a):
         with io.open(plan_path, "w", encoding="utf-8") as fh:
             json.dump(plan, fh, ensure_ascii=False, indent=1)
 
-    build = {"paths": pieces, "transition": a.get("transition") or "fade",
+    if trans_plan is not None:
+        # trans_plan covers the joins BETWEEN photographs; the joins either side of
+        # a clip are a change of medium and always want a real dissolve.
+        full, pi = [], 0
+        for k in range(len(pieces) - 1):
+            a_is_still = k >= len(head_f) and k < len(head_f) + len(stills) - 1
+            b_is_still = k + 1 >= len(head_f) and k + 1 < len(head_f) + len(stills)
+            if a_is_still and b_is_still and pi < len(trans_plan):
+                full.append(trans_plan[pi])
+                pi += 1
+            else:
+                full.append("fade")
+                pi += 1 if a_is_still else 0
+        build_trans = full
+    else:
+        build_trans = a.get("transition") or "fade"
+
+    build = {"paths": pieces, "transition": build_trans,
              "duration": xf, "audio_crossfade": xf, "fps": fps,
              "grain": float(a.get("grain", 0.20)),
              "desaturate": float(a.get("saturation", 1.06)),
@@ -6984,6 +7082,8 @@ def t_montage(a):
         extra.append("their own sound carried across %d cut(s) (%s) so the room does "
                      "not stop dead when the photographs start"
                      % (len(bleeds), ", ".join("%s %.1fs" % (k, d) for _w, k, d in bleeds)))
+    if trans_why:
+        extra.append(trans_why)
     if beat_note:
         extra.append(beat_note)
     if _drift > 0.01 and _warm:
@@ -7829,9 +7929,24 @@ def t_build(a):
         raise ToolError("Give 'paths': the prepared pieces, in play order.")
     srcs = [check_input(p, "video") for p in paths]
 
-    trans = a.get("transition") or "fade"
-    if trans not in TRANSITIONS:
-        raise ToolError("transition must be one of: %s" % ", ".join(TRANSITIONS))
+    # One transition for the whole film is what makes every cut look the same.
+    # `transition` takes a LIST as readily as a name - one entry per join - and
+    # "cut" is a real hard cut, done as a single-frame xfade because concat and
+    # xfade cannot share a filter graph.
+    _tr = a.get("transition") or "fade"
+    n_joins = max(0, len(paths) - 1)
+    if isinstance(_tr, (list, tuple)):
+        if len(_tr) != n_joins:
+            raise ToolError("transition has %d entries for %d join(s) - give one name, "
+                            "or exactly one per join." % (len(_tr), n_joins))
+        trans_list = [str(x) for x in _tr]
+    else:
+        trans_list = [str(_tr)] * n_joins
+    for t_ in trans_list:
+        if t_ != "cut" and t_ not in TRANSITIONS:
+            raise ToolError("'%s' is not a transition. Use 'cut', or one of: %s, ..."
+                            % (t_, ", ".join(TRANSITIONS[:12])))
+    trans = trans_list[0] if trans_list else "fade"
     jd = max(float(a.get("duration", 0.08)), 1.0 / 60)
     lead = float(a.get("audio_lead", 0) or 0)
     a_cross = float(a.get("audio_crossfade", 0) or 0) or max(jd, 0.25)
@@ -7856,10 +7971,16 @@ def t_build(a):
     v_at = [0.0]
     for i in range(1, len(srcs)):
         out_l = "[vx%d]" % i
+        want = trans_list[i - 1]
+        # A hard cut is a ONE-FRAME xfade. concat and xfade cannot live in the
+        # same filter graph ("Error reinitializing filters"), and one frame of
+        # fade at 30fps is imperceptible.
+        this = "fade" if want == "cut" else want
+        d_i = (1.0 / fps) if want == "cut" else jd
         parts.append("%s[v%d]xfade=transition=%s:duration=%.3f:offset=%.3f%s"
-                     % (cur, i, trans, jd, max(0.0, total - jd), out_l))
-        v_at.append(total - jd)
-        total = total + durs[i] - jd
+                     % (cur, i, this, d_i, max(0.0, total - d_i), out_l))
+        v_at.append(total - d_i)
+        total = total + durs[i] - d_i
         cur = out_l
 
     vchain = []
