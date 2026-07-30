@@ -5504,6 +5504,11 @@ def _photo_taken(path):
     Phones number files in shooting order, so the name is a decent fallback - but
     only within one camera. EXIF is the only thing that survives copying a folder
     together from three people's phones, which is how a family album is made.
+
+    Returns None when there is no date, so the caller can SAY it fell back rather
+    than reporting date order it did not actually do. Saving a photo through a
+    chat app or a download strips EXIF completely: on the album this was written
+    for, nought of twenty-one still had a date.
     """
     try:
         from PIL import Image
@@ -5511,10 +5516,10 @@ def _photo_taken(path):
         for tag in (36867, 36868, 306):     # DateTimeOriginal, Digitized, DateTime
             v = exif.get(tag)
             if v:
-                return (0, str(v), os.path.basename(path).lower())
+                return str(v)
     except Exception:
         pass
-    return (1, "", os.path.basename(path).lower())
+    return None
 
 
 def _loud_windows(src, want, length, gap=4.0):
@@ -5612,10 +5617,22 @@ def t_montage(a):
     order = (a.get("order") or "date").lower()
     if order not in ("date", "name", "given"):
         raise ToolError("order must be date, name or given.")
+    dated = {p: _photo_taken(p) for p in photos} if order == "date" else {}
+    with_date = sum(1 for v in dated.values() if v)
     if order == "date":
-        photos.sort(key=_photo_taken)
+        photos.sort(key=lambda p: (0, dated[p], os.path.basename(p).lower())
+                    if dated[p] else (1, "", os.path.basename(p).lower()))
     elif order == "name":
         photos.sort(key=lambda p: os.path.basename(p).lower())
+    order_said = {"date": "date-taken", "name": "filename",
+                  "given": "the given"}[order] + " order"
+    if order == "date" and with_date < len(photos):
+        order_said = ("filename order - %d of %d photos have no date in them, so "
+                      "date order was not available and the sequence is only as good "
+                      "as the numbering"
+                      % (len(photos) - with_date, len(photos))) if not with_date else (
+                      "date order for %d photos, filename order for the %d with no date"
+                      % (with_date, len(photos) - with_date))
 
     # Chronological is the truth and is usually the right spine, but the last frame
     # is the one thing it reliably gets wrong: an evening does not end on its best
@@ -5791,8 +5808,7 @@ def t_montage(a):
         build["music"], build["music_volume"] = music, mvol
     msg = t_build(build)
 
-    extra = ["%d photo(s) in %s order" % (len(photos),
-             {"date": "date-taken", "name": "filename", "given": "the given"}[order])]
+    extra = ["%d photo(s) in %s" % (len(photos), order_said)]
     if head_f or tail_f:
         extra.append("%d moment(s) lifted from %d clip(s) by where the room got loudest"
                      % (len(head_f) + len(tail_f), len(clips)))
