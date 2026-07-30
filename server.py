@@ -6520,6 +6520,12 @@ def t_build(a):
 
     target = float(a.get("target_lufs", -14))
     peak = float(a.get("true_peak", -1.5))
+    # loudnorm aims at a TRUE peak, which is an estimate of what the waveform does
+    # between samples - so a source that is already squared off at full scale can
+    # still put samples on the rail afterwards. A hard ceiling behind it costs
+    # nothing and makes the promise in `true_peak` actually hold.
+    ceiling = "alimiter=limit=%.4f:attack=5:release=60:level=disabled" \
+              % min(0.999, 10.0 ** (peak / 20.0))
     note = ""
     if has_snd:
         # measure on the assembled AUDIO only - seconds, and no video decode
@@ -6532,17 +6538,31 @@ def t_build(a):
         except (ValueError, KeyError):
             pass
         if vals:
-            # target_offset is not optional: leaving it out landed the finished ad
+            # Linear mode applies ONE fixed gain across the whole thing, which is
+            # what keeps a mix sounding untouched - but it does not limit. A quiet
+            # cut needing a big lift will then clip: a family video measured at
+            # -18.18 LUFS wanted +4.18 dB and came out slamming 0.0 dBTP. Dynamic
+            # mode carries its own true-peak limiter, so hand over to it when the
+            # arithmetic says linear cannot land inside the ceiling.
+            gain = target - float(vals["input_i"])
+            linear = float(vals["input_tp"]) + gain <= peak + 0.1
+            # target_offset is not optional: leaving it out landed a finished ad
             # at -15.06 LUFS against a -14.0 target, measured.
             final = ("%sloudnorm=I=%.1f:TP=%.1f:measured_I=%s:measured_TP=%s:"
-                     "measured_LRA=%s:measured_thresh=%s:offset=%s:linear=true[aout]"
+                     "measured_LRA=%s:measured_thresh=%s:offset=%s%s[aout]"
                      % (acur, target, peak, vals["input_i"], vals["input_tp"],
                         vals["input_lra"], vals["input_thresh"],
-                        vals.get("target_offset", "0.0")))
+                        vals.get("target_offset", "0.0"),
+                        ":linear=true" if linear else ""))
+            final = final.replace("[aout]", "," + ceiling + "[aout]")
             note = "\n  Loudness measured then corrected in one go (%s -> %.1f LUFS)." \
                    % (vals["input_i"], target)
+            if not linear:
+                note += ("\n  A flat %+.1f dB lift would have peaked at %.1f dBTP, so the "
+                         "levelling rides the loud moments instead."
+                         % (gain, float(vals["input_tp"]) + gain))
         else:
-            final = "%sloudnorm=I=%.1f:TP=%.1f[aout]" % (acur, target, peak)
+            final = "%sloudnorm=I=%.1f:TP=%.1f,%s[aout]" % (acur, target, peak, ceiling)
             note = "\n  Loudness corrected in a single pass - the measurement did not parse."
     else:
         final = None
