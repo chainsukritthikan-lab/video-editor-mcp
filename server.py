@@ -8212,37 +8212,61 @@ MUSIC_OK = {"cc0": "no credit needed", "pdm": "public domain, no credit needed",
 _LAST_FIND = {}
 
 
-def _openverse(query, page_size=20):
-    """Search Openverse. Anonymous access is rate limited, so say so when it bites.
+ANON_PAGE_MAX = 20      # measured: 20 works, 21 returns 401. Not a rate limit.
 
-    Two things the API is strict about: a request with no User-Agent is refused outright
-    (403), and unauthenticated callers get a small hourly allowance, after which it
-    answers 401 rather than 429. Reporting that as "could not reach the library" sends
-    someone hunting a network problem they do not have.
+
+def _openverse(query, want=20):
+    """Search Openverse, paging round the anonymous limit.
+
+    An anonymous caller may ask for at most TWENTY results per page. Ask for
+    twenty-one and the answer is 401, which looks exactly like an auth failure or
+    a throttle and is neither - it is a hard cap on page size. This code used to
+    request fifty, so every search failed, every time, and the error it raised
+    said "rate limited, wait a few minutes". That message was wrong for as long as
+    it existed, and waiting could never have fixed it. Verified by bisection:
+    page_size 3, 10 and 20 all return 200; 21, 30 and 50 all return 401.
+
+    So: page through in twenties instead. A request with no User-Agent really is
+    refused (403), which is a separate thing and still true.
     """
     import urllib.request, urllib.parse
-    url = "https://api.openverse.org/v1/audio/?" + urllib.parse.urlencode(
-        {"q": query, "page_size": min(50, max(1, page_size)),
-         "license_type": "commercial,modification"})
-    last = None
-    for attempt in range(3):
-        req = urllib.request.Request(url, headers={"User-Agent": "video-editor-mcp/1.0"})
+    results, page, last = [], 1, None
+    while len(results) < want and page <= 6:
+        url = "https://api.openverse.org/v1/audio/?" + urllib.parse.urlencode(
+            {"q": query, "page_size": ANON_PAGE_MAX, "page": page,
+             "license_type": "commercial,modification"})
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "video-editor-mcp/1.0 (+local editing tool)"})
         try:
             with urllib.request.urlopen(req, timeout=30) as fh:
-                return json.load(fh)
+                data = json.load(fh)
         except Exception as e:
             last = e
-            code = getattr(e, "code", None)
-            if code in (401, 403, 429) and attempt < 2:
-                time.sleep(2.0 * (attempt + 1))
+            if getattr(e, "code", None) == 429 and page == 1:
+                time.sleep(2.0)
                 continue
             break
+        got = data.get("results") or []
+        results.extend(got)
+        if len(got) < ANON_PAGE_MAX or page >= (data.get("page_count") or 1):
+            last = None
+            break
+        page += 1
+        last = None
+
+    if results:
+        return {"results": results, "result_count": len(results)}
+    if last is None:
+        return {"results": [], "result_count": 0}
     code = getattr(last, "code", None)
-    if code in (401, 429):
-        raise ToolError("The music library is rate limiting us (HTTP %s). Anonymous "
-                        "searches get a small hourly allowance and it is used up. Wait a "
-                        "few minutes and search again - already-downloaded tracks are "
-                        "unaffected." % code)
+    if code == 429:
+        raise ToolError("The music library is throttling us (HTTP 429). This one really "
+                        "is a rate limit - wait a minute. Downloaded tracks are unaffected.")
+    if code == 401:
+        raise ToolError("The music library refused the request (HTTP 401). Anonymous "
+                        "callers may ask for at most %d results a page; asking for more "
+                        "returns this. If you see it, something is requesting a larger "
+                        "page than that." % ANON_PAGE_MAX)
     raise ToolError("Could not reach the music library (%s: %s). This is the only tool "
                     "here that needs an internet connection."
                     % (type(last).__name__, last))
