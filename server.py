@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import glob as globmod
+from concurrent.futures import ThreadPoolExecutor
 
 # ---------------------------------------------------------------- encoding
 # Windows default codepage (cp874 on Thai systems) mangles JSON. Force UTF-8.
@@ -5497,6 +5498,309 @@ def t_remove_logo(a):
                 % (w, h, x, y))
 
 
+def _photo_taken(path):
+    """When the photo was taken, for putting an evening back in order.
+
+    Phones number files in shooting order, so the name is a decent fallback - but
+    only within one camera. EXIF is the only thing that survives copying a folder
+    together from three people's phones, which is how a family album is made.
+    """
+    try:
+        from PIL import Image
+        exif = Image.open(path)._getexif() or {}
+        for tag in (36867, 36868, 306):     # DateTimeOriginal, Digitized, DateTime
+            v = exif.get(tag)
+            if v:
+                return (0, str(v), os.path.basename(path).lower())
+    except Exception:
+        pass
+    return (1, "", os.path.basename(path).lower())
+
+
+def _loud_windows(src, want, length, gap=4.0):
+    """The moments in a clip where something actually happens.
+
+    A birthday video is one long take in which two things matter - the singing and
+    the cheer - and both are found by level, not by the words: laughter, clapping
+    and singing never reach a transcript. Measured on a real one, the cheer sat 6 dB
+    above the chatter either side of it.
+    """
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", os.path.abspath(src),
+                          "-ac", "1", "-ar", "16000", "-f", "f32le", "-"],
+                         capture_output=True).stdout
+    total = video_duration_of(src)
+    step = 0.5
+    try:
+        import numpy as np
+    except ImportError:
+        return [(0.0, min(length, total))]
+    x = np.frombuffer(raw, dtype=np.float32)
+    n = int(16000 * step)
+    if len(x) < n * 4:
+        return [(0.0, min(length, total))]
+    lev = np.array([float(np.sqrt(np.mean(x[i:i + n] ** 2)))
+                    for i in range(0, len(x) - n, n)])
+    span = max(1, int(round(length / step)))
+    # energy of every candidate window, by rolling sum
+    cum = np.concatenate([[0.0], np.cumsum(lev)])
+    score = cum[span:] - cum[:-span]
+    picks = []
+    for _ in range(want):
+        if not len(score) or float(score.max()) <= 0:
+            break
+        i = int(score.argmax())
+        start = min(max(0.0, i * step), max(0.0, total - length))
+        picks.append((start, min(total, start + length)))
+        lo = max(0, int(i - (length + gap) / step))
+        hi = min(len(score), int(i + (length + gap) / step))
+        score[lo:hi] = 0.0
+    return sorted(picks) or [(0.0, min(length, total))]
+
+
+def _kb_filter(i, dur, cw, ch, fps):
+    """A slow move on a still, alternating in and out so a run never pulses.
+
+    Driven by the output frame number rather than by accumulating `zoom+step`: the
+    accumulating form drifts, and over a couple of seconds the drift shows up as the
+    move easing off early. Working at twice the output size keeps it smooth -
+    zoompan steps in whole source pixels.
+    """
+    fr = max(2, int(round(dur * fps)))
+    step = 0.13 / fr
+    z = ("min(1.0+%.6f*on,1.13)" if i % 2 == 0 else "max(1.13-%.6f*on,1.0)") % step
+    tilt = 0.022 * ((i % 4) - 1.5)
+    return ("scale=%d:%d:force_original_aspect_ratio=increase:flags=lanczos,crop=%d:%d,"
+            "zoompan=z='%s':d=%d:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)+%.4f*ih*on/%d':"
+            "s=%dx%d:fps=%d,unsharp=5:5:0.45:3:3:0.2"
+            % (cw * 2, ch * 2, cw * 2, ch * 2, z, fr, tilt, fr, cw, ch, fps))
+
+
+def _panel_filter(cw, ch, fps):
+    """A clip of the wrong shape, in its own panel over a blur of itself.
+
+    Cropping a group shot to a tall frame throws away whoever is standing at the
+    edges - which at a party is half the family. The blur reads as deliberate.
+    """
+    return ("[0:v]split=2[a][b];"
+            "[a]scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d,"
+            "gblur=sigma=30,eq=brightness=-0.07:saturation=0.75[bg];"
+            "[b]scale=%d:-2:flags=lanczos,unsharp=5:5:0.5:3:3:0.25[fg];"
+            "[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,fps=%d[v]"
+            % (cw, ch, cw, ch, cw, fps))
+
+
+def t_montage(a):
+    """Photos and clips into one film: order, motion, music that ducks, titles.
+
+    Everything here is a judgement that had to be made by hand the first time and
+    is the same judgement every time: put the evening back in chronological order,
+    open and close on the moments where the room is loudest, move slowly over every
+    still, let a wrongly-shaped clip keep its edges, and pull the music down
+    wherever there is something real to hear.
+
+    What it cannot judge is which photos to leave out, and it does not try.
+    """
+    photos = a.get("photos") or []
+    if isinstance(photos, str) and os.path.isdir(photos):
+        photos = [os.path.join(photos, f) for f in sorted(os.listdir(photos))
+                  if os.path.splitext(f)[1].lower() in
+                  (".jpg", ".jpeg", ".png", ".webp", ".bmp")]
+    photos = [check_input(p, "photo") for p in photos]
+    if not photos:
+        raise ToolError("Give 'photos': a list of image files, or a folder of them.")
+
+    order = (a.get("order") or "date").lower()
+    if order not in ("date", "name", "given"):
+        raise ToolError("order must be date, name or given.")
+    if order == "date":
+        photos.sort(key=_photo_taken)
+    elif order == "name":
+        photos.sort(key=lambda p: os.path.basename(p).lower())
+
+    # Chronological is the truth and is usually the right spine, but the last frame
+    # is the one thing it reliably gets wrong: an evening does not end on its best
+    # picture, it ends on whatever happened last. On the birthday this tool was
+    # built from, date order finished on two children eating cherries in the
+    # kitchen instead of on both of them kissing her. Naming the closer is the one
+    # piece of judgement worth asking for.
+    def lift(which, to_front):
+        want = a.get(which)
+        if not want:
+            return
+        key = os.path.splitext(os.path.basename(str(want)))[0].lower()
+        hit = next((p for p in photos
+                    if os.path.splitext(os.path.basename(p))[0].lower() == key), None)
+        if hit is None:
+            hit = next((p for p in photos if key in os.path.basename(p).lower()), None)
+        if hit is None:
+            raise ToolError("%s: no photo here is called '%s'." % (which, want))
+        photos.remove(hit)
+        photos.insert(0, hit) if to_front else photos.append(hit)
+
+    lift("open_with", True)
+    lift("finish_with", False)
+
+    clips = [check_input(c, "clip") for c in (a.get("clips") or [])]
+    per = float(a.get("seconds_each", 2.4))
+    hold = float(a.get("hold_last", per * 1.9))
+    xf = float(a.get("transition_seconds", 0.45))
+    fps = int(a.get("fps") or 30)
+
+    # Shape follows the photos: most family albums are portrait, and forcing them
+    # into a landscape frame pillarboxes twenty pictures to accommodate one clip.
+    shape = (a.get("shape") or "auto").lower()
+    if shape == "auto":
+        tall = 0
+        for p in photos:
+            try:
+                from PIL import Image
+                with Image.open(p) as im:
+                    tall += 1 if im.height >= im.width else -1
+            except Exception:
+                pass
+        shape = "4:5" if tall >= 0 else "16:9"
+    sizes = {"4:5": (1080, 1350), "9:16": (1080, 1920), "1:1": (1080, 1080),
+             "16:9": (1920, 1080), "3:4": (1080, 1440)}
+    if shape not in sizes:
+        raise ToolError("shape must be auto, 4:5, 9:16, 1:1, 3:4 or 16:9.")
+    cw, ch = sizes[shape]
+
+    tmp = _tmpdir()
+    tag = os.getpid()
+
+    def still(spec):
+        i, path, dur = spec
+        out = os.path.join(tmp, "mg_s%d_%03d.mp4" % (tag, i))
+        subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-loop", "1", "-r", str(fps),
+             "-i", os.path.abspath(path),
+             "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+             "-t", "%.3f" % dur, "-vf", _kb_filter(i, dur, cw, ch, fps),
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "16",
+             "-threads", "2", "-pix_fmt", "yuv420p",
+             "-c:a", "aac", "-b:a", "128k", "-shortest", out], check=True)
+        return out
+
+    def moment(spec):
+        k, src, a0, b0 = spec
+        out = os.path.join(tmp, "mg_c%d_%03d.mp4" % (tag, k))
+        args = ["ffmpeg", "-y", "-v", "error", "-ss", "%.3f" % a0,
+                "-i", os.path.abspath(src), "-t", "%.3f" % (b0 - a0),
+                "-filter_complex", _panel_filter(cw, ch, fps), "-map", "[v]"]
+        args += (["-map", "0:a"] if has_audio(src) else
+                 ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-map", "1:a",
+                  "-shortest"])
+        subprocess.run(args + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "16",
+                               "-threads", "2", "-pix_fmt", "yuv420p",
+                               "-c:a", "aac", "-b:a", "192k", out], check=True)
+        return out
+
+    # --- what goes where ------------------------------------------------------
+    clip_len = float(a.get("clip_seconds", 13.0))
+    tail_len = float(a.get("clip_tail_seconds", 3.7))
+    heads, tails = [], []
+    for src in clips:
+        if a.get("clip_highlights", True) and has_audio(src):
+            picks = _loud_windows(src, 2, clip_len)
+            heads.append((src,) + picks[0])
+            if len(picks) > 1:
+                tails.append((src, picks[-1][0], min(picks[-1][0] + tail_len,
+                                                     video_duration_of(src))))
+        else:
+            heads.append((src, 0.0, min(clip_len, video_duration_of(src))))
+
+    jobs = [(i, p, hold if i == len(photos) - 1 else per)
+            for i, p in enumerate(photos)]
+    workers = max(2, min(4, (os.cpu_count() or 4) // 3))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        stills = list(ex.map(still, jobs))
+        head_f = list(ex.map(moment, [(i, s, x, y) for i, (s, x, y) in enumerate(heads)]))
+        tail_f = list(ex.map(moment, [(90 + i, s, x, y)
+                                      for i, (s, x, y) in enumerate(tails)]))
+
+    pieces = head_f + stills[:-1] + tail_f + stills[-1:]
+    lens = ([b - x for _, x, b in heads] + [per] * (len(stills) - 1) +
+            [b - x for _, x, b in tails] + [hold])
+
+    at, marks = 0.0, []
+    for d in lens:
+        marks.append(at)
+        at += d - xf
+    total = at + xf
+    last_at = marks[-1]
+    sound_at = ([(marks[i], marks[i] + lens[i]) for i in range(len(head_f))] +
+                [(marks[len(head_f) + len(stills) - 1 + i],
+                  marks[len(head_f) + len(stills) - 1 + i] + lens[len(head_f) + len(stills) - 1 + i])
+                 for i in range(len(tail_f))])
+
+    # --- music, pulled down wherever the room can be heard ---------------------
+    music, mvol = a.get("music"), float(a.get("music_volume", 0.75))
+    if music:
+        music = check_input(music, "music")
+    elif a.get("music_mood", "warm"):
+        music = os.path.join(tmp, "mg_bed_%d.wav" % tag)
+        t_music_generate({"mood": a.get("music_mood") or "warm",
+                          "duration": total + 2.0, "bpm": a.get("music_bpm") or 92,
+                          "pulse_level": 0.35, "output": music})
+    if music and sound_at:
+        # One expression rather than a chain of volume filters, so the ramps cross
+        # cleanly instead of multiplying together at the joins.
+        duckv = float(a.get("music_duck", 0.20))
+        e, closes = "", 0
+        for s, en in sound_at:
+            e += ("if(lt(t,%.2f),%.3f,if(lt(t,%.2f),%.3f+(%.3f)*(t-%.2f)/0.90,"
+                  "if(lt(t,%.2f),%.3f,if(lt(t,%.2f),%.3f+(%.3f)*(t-%.2f)/0.90,"
+                  % (s - 1.1, mvol, s - 0.2, mvol, duckv - mvol, s - 1.1,
+                     en - 0.5, duckv, en + 0.4, duckv, mvol - duckv, en - 0.5))
+            closes += 4
+        e += "%.3f%s" % (mvol, ")" * closes)
+        ducked = os.path.join(tmp, "mg_duck_%d.wav" % tag)
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", os.path.abspath(music),
+                        "-af", "volume='%s':eval=frame,afade=t=out:st=%.2f:d=2.0"
+                        % (e, max(0.1, total - 2.2)), ducked], check=True)
+        music, mvol = ducked, 1.0
+
+    cues = list(a.get("captions") or [])
+    if a.get("title"):
+        cues.insert(0, {"start": "%.2f" % min(1.1, total * 0.05),
+                        "end": "%.2f" % min(5.4, total * 0.25),
+                        "text": a["title"]})
+    if a.get("closing"):
+        cues.append({"start": "%.2f" % (last_at + 0.55),
+                     "end": "%.2f" % max(last_at + 1.2, total - 0.35),
+                     "text": a["closing"]})
+
+    build = {"paths": pieces, "transition": a.get("transition") or "fade",
+             "duration": xf, "audio_crossfade": xf, "fps": fps,
+             "grain": float(a.get("grain", 0.20)),
+             "desaturate": float(a.get("saturation", 1.06)),
+             "speech_timing": False,
+             "font": a.get("font") or "TH Baijam",
+             "font_scale": float(a.get("font_scale", 3.5)),
+             "outline": float(a.get("outline", 0.095)),
+             "glow": float(a.get("glow", 0.9)),
+             "accent": a.get("accent") or "#ffd479",
+             "text_color": a.get("text_color") or "#ffffff",
+             "margin_bottom": float(a.get("margin_bottom", 0.055)),
+             "target_lufs": a.get("target_lufs", -14),
+             "true_peak": a.get("true_peak", -1.5),
+             "output": make_output(photos[0], "montage", a.get("output"), ".mp4")}
+    if cues:
+        build["captions"] = cues
+    if music:
+        build["music"], build["music_volume"] = music, mvol
+    msg = t_build(build)
+
+    extra = ["%d photo(s) in %s order" % (len(photos),
+             {"date": "date-taken", "name": "filename", "given": "the given"}[order])]
+    if head_f or tail_f:
+        extra.append("%d moment(s) lifted from %d clip(s) by where the room got loudest"
+                     % (len(head_f) + len(tail_f), len(clips)))
+    if sound_at and music:
+        extra.append("music ducked under %d of them" % len(sound_at))
+    return msg + "\n  " + "; ".join(extra) + "."
+
+
 def t_slideshow(a):
     """Build a clip out of stills, each drifting slowly so nothing sits dead."""
     images = a.get("images") or []
@@ -7238,6 +7542,75 @@ def t_voice_over(a):
 
 
 TOOLS = [
+    {
+        "name": "photo_montage",
+        "description": "A folder of photos - and optionally the video someone took at the "
+                       "same event - into one finished film. Puts the pictures back in the "
+                       "order they were taken, moves slowly over each one, lifts the best "
+                       "moments out of the clips by finding where the room got loudest, "
+                       "keeps a wrongly-shaped clip's edges instead of cropping people out, "
+                       "lays music underneath that ducks wherever there is something real "
+                       "to hear, and burns the title and closing line. Use for a birthday, "
+                       "a wedding, a trip - anything where the deliverable is 'all of these "
+                       "photos, as one video'.",
+        "handler": t_montage,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "photos": {"description": "A list of image files, or one folder path.",
+                           "oneOf": [{"type": "array", "items": {"type": "string"}},
+                                     {"type": "string"}]},
+                "clips": {"type": "array", "items": {"type": "string"},
+                          "description": "Video shot at the same event. The strongest moment "
+                                         "opens the film and the next one closes it."},
+                "clip_highlights": {"type": "boolean",
+                                    "description": "Default true: pick those moments by "
+                                                   "level. False takes each clip from its "
+                                                   "start."},
+                "clip_seconds": {"type": "number", "description": "Opening moment, default 13."},
+                "clip_tail_seconds": {"type": "number",
+                                      "description": "Closing moment, default 3.7."},
+                "order": {"enum": ["date", "name", "given"],
+                          "description": "Default date - EXIF date taken, which survives "
+                                         "photos being collected from several phones."},
+                "finish_with": {"type": "string",
+                                "description": "Filename of the photo to END on. Worth "
+                                               "setting: date order finishes on whatever "
+                                               "happened last, which is rarely the best "
+                                               "last frame."},
+                "open_with": {"type": "string",
+                              "description": "Filename of the photo to lead with."},
+                "shape": {"enum": ["auto", "4:5", "9:16", "1:1", "3:4", "16:9"],
+                          "description": "Default auto: follows whichever way most of the "
+                                         "photos face."},
+                "seconds_each": {"type": "number", "description": "Per photo, default 2.4."},
+                "hold_last": {"type": "number",
+                              "description": "The final photo, so a closing line can be read."},
+                "transition_seconds": {"type": "number", "description": "Dissolve, default 0.45."},
+                "title": {"type": "string", "description": "Opening line, \\n for a break."},
+                "closing": {"type": "string", "description": "Closing line, \\n for a break."},
+                "captions": {"type": "array",
+                             "description": "Any further [{start, end, text}] of your own.",
+                             "items": {"type": "object", "properties": {
+                                 "start": {"type": "string"}, "end": {"type": "string"},
+                                 "text": {"type": "string"}}}},
+                "music": {"type": "string", "description": "A track of your own. Left out, "
+                                                           "one is synthesised."},
+                "music_mood": {"enum": ["calm", "uplifting", "warm", "tense", "gentle"]},
+                "music_bpm": {"type": "number"},
+                "music_volume": {"type": "number", "description": "Default 0.75."},
+                "music_duck": {"type": "number",
+                               "description": "Level under the clips, default 0.20."},
+                "font": {"type": "string"}, "font_scale": {"type": "number"},
+                "accent": {"type": "string"}, "text_color": {"type": "string"},
+                "outline": {"type": "number"}, "glow": {"type": "number"},
+                "margin_bottom": {"type": "number"},
+                "grain": {"type": "number"}, "saturation": {"type": "number"},
+                "transition": {"type": "string"}, "fps": {"type": "integer"},
+                "target_lufs": {"type": "number"}, "true_peak": {"type": "number"},
+                "output": {"type": "string"}},
+            "required": ["photos"]},
+    },
     {
         "name": "video_build",
         "description": "Join, grade, caption, score and level a cut in ONE pass over the "
