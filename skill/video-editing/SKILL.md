@@ -46,6 +46,19 @@ you add is the judging, so spend the time there and let the tools do the rest.
    renderer for the same look. `remotion` remains only for changes ASS cannot
    express. `video_build` already uses the libass path.
 
+4c. **You cannot hear and you cannot watch. Use the two tools that stand in for it.**
+   - **`music_describe` before putting ANY track under a film.** It names the
+     instruments, the tempo, the colour, and - the one that decides most edits -
+     whether the track BUILDS or sits flat. Written after scoring a birthday film
+     and having to admit the music was a guess. Run on that same track afterwards
+     it said "161 BPM, restless under anything tender", which was the answer.
+   - **`video_shape` before delivering.** A grid of stills shows every moment and
+     none of the SHAPE. Brightness, motion and sound as lanes on one clock: a
+     zig-zag brightness lane is a montage that flickers, a flat motion lane is a
+     dead stretch, a sound lane that never dips is music nobody ducked. A
+     twenty-one-photo montage flickering across 91 points of brightness looked
+     perfectly fine in stills and is obvious in one glance here.
+
 5. **Review before delivering.** `video_review` with the .srt you burned, then
    `sound_faults`, then `video_check`. Three different questions: does the
    picture read, does the mix have a fault, are the numbers right. Look at the

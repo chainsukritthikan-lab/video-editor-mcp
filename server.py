@@ -4875,6 +4875,281 @@ def listen_to(path, seconds=12.0):
     return sorted(best.items(), key=lambda kv: -kv[1])[:5]
 
 
+def t_video_shape(a):
+    """The whole film as one picture: pacing, brightness, motion, sound, cuts.
+
+    Written because of a real failure too. I judge a film from a grid of stills,
+    which shows me every moment and none of the shape - so a montage that flickered
+    light-dark-light across twenty-one photos looked perfectly fine in stills and
+    was only caught later by measuring. Stills cannot show change over time, and
+    change over time is what pacing IS.
+
+    This turns the time axis into something readable: four lanes on one image, all
+    on the same clock. A brightness lane that zig-zags is a montage that flickers.
+    A motion lane that flatlines is a dead stretch. A sound lane that does not dip
+    where the picture has a voice is music that has not been ducked. None of that
+    is visible in a contact sheet.
+    """
+    import numpy as np
+    from PIL import Image, ImageDraw
+
+    src = check_input(a.get("path"), "video")
+    total = video_duration_of(src)
+    if total < 1.0:
+        raise ToolError("Too short to have a shape.")
+    rate = 4.0                      # samples per second - enough to see a 0.45s dissolve
+    tw, th = 64, 36
+
+    p = subprocess.run([FFMPEG, "-hide_banner", "-nostdin", "-v", "error", "-i", src,
+                        "-vf", "fps=%g,scale=%d:%d,format=gray" % (rate, tw, th),
+                        "-f", "rawvideo", "-"],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                       timeout=FFMPEG_TIMEOUT,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    buf = np.frombuffer(p.stdout, dtype=np.uint8)
+    nf = buf.size // (tw * th)
+    if nf < 4:
+        raise ToolError("Could not read frames from %s" % os.path.basename(src))
+    fr = buf[:nf * tw * th].reshape(nf, th, tw).astype(np.float32)
+
+    bright = fr.reshape(nf, -1).mean(axis=1)
+    motion = np.concatenate([[0.0], np.abs(np.diff(fr.reshape(nf, -1), axis=0)).mean(axis=1)])
+
+    snd = np.zeros(nf)
+    if has_audio(src):
+        sr = 8000
+        q = subprocess.run([FFMPEG, "-hide_banner", "-nostdin", "-v", "error", "-i", src,
+                            "-ac", "1", "-ar", str(sr), "-f", "f32le", "-"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=FFMPEG_TIMEOUT,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        y = np.frombuffer(q.stdout, dtype="<f4").astype(np.float64)
+        step = max(1, int(sr / rate))
+        r = np.array([float(np.sqrt(np.mean(y[i:i + step] ** 2)) + 1e-9)
+                      for i in range(0, max(step, len(y) - step), step)])
+        r = 20 * np.log10(r / max(r.max(), 1e-9))
+        r = np.clip((r + 45) / 45.0, 0, 1)
+        snd = np.interp(np.linspace(0, len(r) - 1, nf), np.arange(len(r)), r)
+
+    # A cut is a jump in the picture far above what this film normally does, so the
+    # threshold comes from the film itself - a fixed one finds twelve cuts in a
+    # seven-shot piece, or none at all in a gentle one.
+    thr = float(np.median(motion) + 4.5 * (np.percentile(motion, 75) -
+                                           np.percentile(motion, 25)) + 2.0)
+    cuts = [i for i in range(1, nf) if motion[i] > thr]
+    cuts = [c for i, c in enumerate(cuts) if i == 0 or c - cuts[i - 1] > rate * 0.4]
+
+    # ------------------------------------------------------------------ drawing
+    W, LANE, PAD, THUMB = 1180, 74, 34, 96
+    H = PAD + THUMB + LANE * 3 + 46
+    im = Image.new("RGB", (W, H), (16, 18, 24))
+    d = ImageDraw.Draw(im)
+    x_of = lambda i: PAD + int(i / max(1, nf - 1) * (W - PAD * 2))
+
+    n_th = max(4, min(11, int((W - PAD * 2) / (THUMB * 1.5))))
+    tw2 = int((W - PAD * 2) / n_th) - 4
+    for k in range(n_th):
+        at = total * (k + 0.5) / n_th
+        f = os.path.join(_tmpdir(), "shape_%d_%d.png" % (os.getpid(), k))
+        subprocess.run([FFMPEG, "-hide_banner", "-nostdin", "-v", "error",
+                        "-ss", "%.3f" % at, "-i", src, "-frames:v", "1",
+                        "-vf", "scale=%d:-1" % tw2, f],
+                       capture_output=True, timeout=120,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if os.path.isfile(f):
+            with Image.open(f) as t:
+                t = t.convert("RGB")
+                t.thumbnail((tw2, THUMB))
+                im.paste(t, (PAD + k * (tw2 + 4), PAD))
+
+    def lane(idx, values, colour, title, lo=None, hi=None):
+        top = PAD + THUMB + 8 + idx * LANE
+        base = top + LANE - 20
+        d.rectangle([PAD, top, W - PAD, base], fill=(22, 26, 34))
+        v = np.asarray(values, dtype=np.float64)
+        lo = float(v.min()) if lo is None else lo
+        hi = float(v.max()) if hi is None else hi
+        rng = max(1e-6, hi - lo)
+        pts = [(x_of(i), base - int((v[i] - lo) / rng * (LANE - 26)))
+               for i in range(len(v))]
+        d.line(pts, fill=colour, width=2)
+        d.text((PAD + 3, top + 2), title, fill=(150, 160, 172))
+        d.text((W - PAD - 74, top + 2), "%.0f-%.0f" % (lo, hi), fill=(105, 114, 126))
+        return top, base
+
+    # Drawn against its OWN range, not 0-255. On an absolute scale a 78-point
+    # swing across twenty-one photos is a barely-visible wobble, which is exactly
+    # the flicker this lane exists to show. The printed range says how big it is.
+    lane(0, bright, (255, 214, 120), "BRIGHTNESS   zig-zag = the montage flickers")
+    lane(1, motion, (120, 200, 255), "MOTION   flat = a dead stretch, spikes = cuts")
+    lane(2, snd, (120, 230, 150), "SOUND   should dip where there is a voice", 0, 1)
+
+    for c in cuts:
+        d.line([(x_of(c), PAD + THUMB + 8), (x_of(c), PAD + THUMB + 8 + LANE * 3 - 20)],
+               fill=(90, 70, 70), width=1)
+    for s in range(0, int(total) + 1, max(1, int(total / 12) or 1)):
+        x = x_of(int(s * rate))
+        d.line([(x, H - 30), (x, H - 24)], fill=(90, 98, 110))
+        d.text((x - 8, H - 20), "%ds" % s, fill=(120, 130, 142))
+
+    out = make_output(src, "shape", a.get("output"), ".png")
+    im.save(out)
+
+    # ------------------------------------------------------------------ reading
+    flick = float(np.abs(np.diff(bright)).mean())
+    jumps = [abs(float(bright[c] - bright[c - 1])) for c in cuts] or [0.0]
+    dead = []
+    run_len = 0
+    for i, m in enumerate(motion):
+        if m < np.percentile(motion, 20):
+            run_len += 1
+        else:
+            if run_len >= rate * 3:
+                dead.append((round((i - run_len) / rate, 1), round(run_len / rate, 1)))
+            run_len = 0
+
+    notes = ["%s  %.1fs, %d cut(s) found" % (os.path.basename(src), total, len(cuts))]
+    notes.append("  Brightness moves %.1f of 255 between samples; the biggest jump "
+                 "across a cut is %.0f." % (flick, max(jumps)))
+    if max(jumps) > 28:
+        notes.append("  That is enough to SEE as a flash. Even the exposure across "
+                     "the shots.")
+    if dead:
+        notes.append("  Nothing much moves for %s." %
+                     ", ".join("%.1fs at %ds" % (l, t) for t, l in dead[:3]))
+    if has_audio(src):
+        quiet = float((snd < 0.25).mean() * 100)
+        notes.append("  Sound sits under a quarter level for %.0f%% of it." % quiet)
+    notes.append("\n  Look at the image: four lanes on one clock. This is the part a "
+                 "grid of stills cannot show.")
+    return [{"type": "text", "text": "\n".join(notes) + "\n  -> " + out},
+            image_content(out)]
+
+
+def t_music_describe(a):
+    """What a piece of music actually IS - so a choice can be judged, not guessed.
+
+    Written because of a real failure. Scoring a family birthday film, I picked the
+    music and then had to admit I could not say whether it suited: audio never
+    reaches me, so "does this fit" was a guess dressed up as a decision. I cannot
+    hear, and no tool changes that. What CAN be done is turn the qualities a person
+    hears into ones that can be read.
+
+    Four things decide whether a track fits a film, and all four are measurable:
+      WHAT IT IS      piano, strings, drums, singing - YAMNet already knows
+      HOW FAST        tempo, and whether it is steady
+      ITS SHAPE       does it build toward something, or sit at one level? A flat
+                      track under a story that has a turn is what makes an edit
+                      feel like a slideshow.
+      ITS COLOUR      bright and sparkling, or warm and dark. Spectral centroid.
+
+    None of that is taste. But it is enough to stop a bright 160bpm corporate track
+    going under a grandmother's birthday by accident.
+    """
+    import numpy as np
+    src = check_input(a.get("path"), "audio")
+    total = duration_of(src)
+    win = max(4.0, min(12.0, total / 6.0))
+
+    sr = 22050
+    p = subprocess.run([FFMPEG, "-hide_banner", "-nostdin", "-v", "error", "-i", src,
+                        "-ac", "1", "-ar", str(sr), "-f", "f32le", "-"],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    y = np.frombuffer(p.stdout, dtype="<f4").astype(np.float64)
+    if y.size < sr:
+        raise ToolError("Too short to describe: %s" % os.path.basename(src))
+
+    # --- the shape: loudness second by second, then what that curve DOES --------
+    step = sr // 2
+    frames = [y[i:i + step] for i in range(0, len(y) - step, step)]
+    rms = np.array([float(np.sqrt(np.mean(f ** 2))) + 1e-9 for f in frames])
+    db = 20 * np.log10(rms / max(rms.max(), 1e-9))
+    third = max(1, len(db) // 3)
+    start_l, mid_l, end_l = (float(db[:third].mean()), float(db[third:2 * third].mean()),
+                             float(db[2 * third:].mean()))
+    swing = float(db.max() - np.percentile(db, 5))
+
+    if end_l - start_l > 3.0:
+        shape = "builds - it is louder at the end than the start"
+    elif start_l - end_l > 3.0:
+        shape = "fades away toward the end"
+    elif mid_l - (start_l + end_l) / 2 > 3.0:
+        shape = "peaks in the middle then comes back down"
+    elif swing < 6.0:
+        shape = ("FLAT - it sits at one level throughout. Under a story with a turn "
+                 "in it, that is what makes an edit feel like a slideshow")
+    else:
+        shape = "varies without a clear arc"
+
+    # --- colour: where the energy sits in the spectrum -------------------------
+    seg = y[:sr * 30] if len(y) > sr * 30 else y
+    n = 1 << 12
+    cents = []
+    for i in range(0, max(1, len(seg) - n), n):
+        mag = np.abs(np.fft.rfft(seg[i:i + n] * np.hanning(n)))
+        f = np.fft.rfftfreq(n, 1.0 / sr)
+        if mag.sum() > 1e-6:
+            cents.append(float((f * mag).sum() / mag.sum()))
+    centroid = float(np.median(cents)) if cents else 0.0
+    colour = ("dark and warm" if centroid < 900 else
+              "warm" if centroid < 1600 else
+              "bright" if centroid < 2800 else "very bright, sparkling")
+
+    # --- what it is, sampled across the track rather than only at the start ----
+    heard = {}
+    for at in (total * 0.15, total * 0.5, total * 0.8):
+        clip = os.path.join(_tmpdir(), "md_%d_%d.wav" % (os.getpid(), int(at * 10)))
+        subprocess.run([FFMPEG, "-hide_banner", "-nostdin", "-v", "error",
+                        "-ss", "%.2f" % max(0, at - win / 2), "-i", src,
+                        "-t", "%.2f" % win, "-ac", "1", "-ar", "16000", clip],
+                       capture_output=True, timeout=120,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        try:
+            for lbl, sc in listen_to(clip, win):
+                heard[lbl] = max(heard.get(lbl, 0.0), sc)
+        except ToolError:
+            pass
+    names = [k for k, v in sorted(heard.items(), key=lambda kv: -kv[1])[:6] if v >= 0.10]
+
+    try:
+        env, rate = _onset_envelope(src)
+        bpm, _beats = _beat_grid(env, rate)
+    except Exception:
+        bpm = None
+
+    lines = ["%s  (%.1fs)" % (os.path.basename(src), total)]
+    lines.append("  Sounds like : %s" % (", ".join(names) if names
+                                         else "nothing the classifier is sure of"))
+    lines.append("  Tempo       : %s" % ("%.0f BPM" % bpm if bpm else "no steady pulse"))
+    lines.append("  Colour      : %s (centre of energy %.0f Hz)" % (colour, centroid))
+    lines.append("  Shape       : %s" % shape)
+    lines.append("  Swing       : %.1f dB between its quietest and loudest" % swing)
+
+    fit = []
+    if bpm and bpm >= 140:
+        fit.append("At %.0f BPM this is fast - fine for something energetic, "
+                   "restless under anything tender." % bpm)
+    if bpm and bpm <= 80:
+        fit.append("At %.0f BPM this is slow - good for a reflective piece, "
+                   "sleepy under something upbeat." % bpm)
+    if centroid >= 2800:
+        fit.append("Very bright, so it will sit on top of the picture and be noticed "
+                   "rather than sitting under it.")
+    if swing < 6.0:
+        fit.append("With no dynamic arc it cannot follow a story - if the film has a "
+                   "turn, plan to change track there or duck it yourself.")
+    if any(k.lower() in ("speech", "singing", "conversation", "narration, monologue")
+           for k in names):
+        fit.append("There are VOICES in this. Under dialogue that will fight; "
+                   "check before using it as a bed.")
+    lines.append("\n  " + (" ".join(fit) if fit else
+                           "Nothing here argues against using it as a bed."))
+    lines.append("\n  This is measured, not heard. It says what the music IS; whether "
+                 "it suits your film is still yours to decide.")
+    return "\n".join(lines)
+
+
 def t_sound_identify(a):
     """Label every sound in a folder by what it actually is, not what it is called."""
     folder = a.get("folder")
@@ -7663,6 +7938,35 @@ def t_voice_over(a):
 
 
 TOOLS = [
+    {
+        "name": "video_shape",
+        "description": "LOOK at the SHAPE of a finished film - pacing, brightness, motion "
+                       "and sound as lanes on one clock, returned as an image. A grid of "
+                       "stills shows every moment and none of the shape; this shows what "
+                       "changes over TIME. A zig-zag brightness lane is a montage that "
+                       "flickers, a flat motion lane is a dead stretch, a sound lane that "
+                       "never dips is music nobody ducked. Run it before delivering.",
+        "handler": t_video_shape,
+        "inputSchema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "output": {"type": "string"}},
+            "required": ["path"]},
+    },
+    {
+        "name": "music_describe",
+        "description": "What a piece of music actually IS, so a choice can be judged instead "
+                       "of guessed: what instruments are in it, its tempo, whether it is bright "
+                       "or warm, and - the one that decides most edits - whether it BUILDS or "
+                       "sits flat. Run it before putting any track under a film. It measures; "
+                       "it cannot hear, and it says so.",
+        "handler": t_music_describe,
+        "inputSchema": {
+            "type": "object",
+            "properties": {"path": {"type": "string",
+                                    "description": "A music file, or a video to read the "
+                                                   "music out of."}},
+            "required": ["path"]},
+    },
     {
         "name": "photo_montage",
         "description": "A folder of photos - and optionally the video someone took at the "
