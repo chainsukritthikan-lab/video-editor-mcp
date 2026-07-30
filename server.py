@@ -3145,6 +3145,7 @@ def _render_kinetic_ass(a, src, payload, w, h, total, font, out, text_only=False
     identical colour-and-scale change in one ffmpeg pass. What it cannot do is the soft
     glow around the live word, so this is offered rather than imposed.
     """
+    entrance = bool(a.get("title_motion", True))
     size = int(round(h * 0.030 * float(a.get("font_scale", 1.0))))
     outline = max(1, int(round(size * float(a.get("outline", 0.075)) * 0.55)))
     accent = _ass_colour(a.get("accent"), "&H00FFC87E")
@@ -3205,10 +3206,22 @@ def _render_kinetic_ass(a, src, payload, w, h, total, font, out, text_only=False
                                 % (accent, accent, max(2, int(size * 0.10)),
                                    max(2, int(size * 0.13 * glow))),
                                 "\\alpha&HFF&\\3a&HFF&\\4a&HFF&")))
-            # the text itself, over the halo
-            events.append("Dialogue: 1,%s,%s,K,,0,0,0,,%s"
-                          % (ts(start), ts(end),
-                             line_for("\\c%s\\fscx109\\fscy109" % accent, "")))
+            # the text itself, over the halo.
+            # Text that simply appears is the flattest thing on the screen. A
+            # fade plus a short scale settles it in instead, and in ASS it is
+            # free: the browser title renderer costs ten seconds of startup
+            # before it draws a single frame, for something libass adds in the
+            # same pass as the caption it is already drawing.
+            if entrance and abs(start - payload[0]["s"]) < 0.001:
+                events.append("Dialogue: 1,%s,%s,K,,0,0,0,,"
+                              "{\\fad(320,260)\\fscx108\\fscy108"
+                              "\\t(0,300,\\fscx100\\fscy100)}%s"
+                              % (ts(start), ts(end),
+                                 line_for("\\c%s" % accent, "")))
+            else:
+                events.append("Dialogue: 1,%s,%s,K,,0,0,0,,%s"
+                              % (ts(start), ts(end),
+                                 line_for("\\c%s\\fscx109\\fscy109" % accent, "")))
 
     if text_only:
         return "\n".join(head + events) + "\n"
@@ -6197,13 +6210,31 @@ def _kb_filter(i, dur, cw, ch, fps):
     zoompan steps in whole source pixels.
     """
     fr = max(2, int(round(dur * fps)))
-    step = 0.13 / fr
-    z = ("min(1.0+%.6f*on,1.13)" if i % 2 == 0 else "max(1.13-%.6f*on,1.0)") % step
-    tilt = 0.022 * ((i % 4) - 1.5)
+
+    # Every still moving the same distance at the same rate is a second kind of
+    # metronome - the holds were made uneven and the MOVES were left identical,
+    # which is a machine breathing steadily. Six moves, cycled by position, so a
+    # run never repeats itself twice over: a hard push, a slow pull, a drift with
+    # barely any zoom, a rise, a fall, and one that is almost still. Chosen by
+    # index rather than at random so a saved plan renders the same film twice.
+    MOVES = [
+        (0.155,  1, 0.000,  0.030),   # push in, drifting down
+        (0.090, -1, 0.000, -0.024),   # pull back, rising
+        (0.045,  1, 0.034,  0.000),   # barely zooms - pans across instead
+        (0.130, -1, -0.026, 0.000),   # pull back and slide the other way
+        (0.020,  1, 0.000,  0.010),   # nearly still. Let one just sit there.
+        (0.110,  1, 0.018, -0.018),   # push in on a diagonal
+    ]
+    amt, sign, px, py = MOVES[i % len(MOVES)]
+    lo, hi = (1.0, 1.0 + amt) if sign > 0 else (1.0 + amt, 1.0)
+    step = amt / fr
+    z = (("min(1.0+%.6f*on,%.4f)" % (step, hi)) if sign > 0
+         else ("max(%.4f-%.6f*on,1.0)" % (lo, step)))
     return ("scale=%d:%d:force_original_aspect_ratio=increase:flags=lanczos,crop=%d:%d,"
-            "zoompan=z='%s':d=%d:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)+%.4f*ih*on/%d':"
+            "zoompan=z='%s':d=%d:"
+            "x='iw/2-(iw/zoom/2)+%.4f*iw*on/%d':y='ih/2-(ih/zoom/2)+%.4f*ih*on/%d':"
             "s=%dx%d:fps=%d,unsharp=5:5:0.45:3:3:0.2"
-            % (cw * 2, ch * 2, cw * 2, ch * 2, z, fr, tilt, fr, cw, ch, fps))
+            % (cw * 2, ch * 2, cw * 2, ch * 2, z, fr, px, fr, py, fr, cw, ch, fps))
 
 
 def _look_filter(warmth, vignette, contrast):
@@ -6390,9 +6421,19 @@ def t_montage(a):
     tmp = _tmpdir()
     tag = os.getpid()
 
-    look = _look_filter(float(a.get("warmth", 0.0)),
-                        float(a.get("vignette", 0.0)),
-                        float(a.get("contrast", 0.0)))
+    # A single grade across the whole film is correct and slightly lifeless. Real
+    # ones drift: a shade cooler before anything has happened, warmest by the end.
+    # Nobody watching notices it; they notice that the ending feels warmer.
+    _warm = float(a.get("warmth", 0.0))
+    _drift = float(a.get("warmth_drift", 0.45 if _warm else 0.0))
+
+    def look_at(pos):
+        """pos 0..1 through the film."""
+        return _look_filter(_warm * (1.0 - _drift + _drift * 2.0 * pos),
+                            float(a.get("vignette", 0.0)),
+                            float(a.get("contrast", 0.0)))
+
+    look = look_at(0.5)
     gammas, exp_med, exp_spread = ({}, 0.0, 0.0)
     if a.get("match_exposure", True):
         gammas, exp_med, exp_spread = _exposure_match(
@@ -6404,8 +6445,9 @@ def t_montage(a):
         vf = _kb_filter(i, dur, cw, ch, fps)
         if path in gammas:
             vf = "eq=gamma=%.4f," % gammas[path] + vf
-        if look:
-            vf = vf + "," + look
+        step_look = look_at(i / float(max(1, len(photos) - 1)))
+        if step_look:
+            vf = vf + "," + step_look
         subprocess.run(
             ["ffmpeg", "-y", "-v", "error", "-loop", "1", "-r", str(fps),
              "-i", os.path.abspath(path),
@@ -6503,6 +6545,48 @@ def t_montage(a):
                   marks[len(head_f) + len(stills) - 1 + i] + lens[len(head_f) + len(stills) - 1 + i])
                  for i in range(len(tail_f))])
 
+    # --- their own sound, carried across the cut -------------------------------
+    # The singing stopping dead the instant the photographs start is the loudest
+    # amateur tell in the whole film. A cut in the PICTURE does not have to be a
+    # cut in the SOUND: the room carries on for a moment underneath, then gives
+    # way. Same at the other end - the cheer is heard a beat before it is seen,
+    # so the ending feels arrived at rather than announced.
+    bleeds = []
+    bleed = float(a.get("audio_bleed", 2.2))
+    if bleed > 0.05:
+        for k, (src_, x0, x1) in enumerate(heads + tails):
+            is_head = k < len(head_f)
+            idx = k if is_head else len(head_f) + len(stills) - 1 + (k - len(head_f))
+            if idx >= len(marks):
+                continue
+            dur_src = video_duration_of(src_)
+            if is_head:                       # runs ON past the picture (L-cut)
+                a0, a1 = x1, min(dur_src, x1 + bleed)
+                at = marks[idx] + lens[idx] - xf
+                fade = "afade=t=out:st=0.35:d=%.2f" % max(0.3, (a1 - a0) - 0.35)
+            else:                             # arrives BEFORE it (J-cut)
+                a0, a1 = max(0.0, x0 - bleed), x0
+                at = max(0.0, marks[idx] - (a1 - a0))
+                fade = "afade=t=in:st=0:d=%.2f" % max(0.3, (a1 - a0) * 0.7)
+            if a1 - a0 < 0.4:
+                continue
+            wav = os.path.join(tmp, "mg_bleed%d_%d.wav" % (k, tag))
+            # -t goes BEFORE -i, so it limits what is READ. After -i it limits the
+            # output instead, and adelay has just pushed the sound past that
+            # cutoff - leaving a file of pure padding. Measured: the "bleed" made
+            # the moment 3 dB QUIETER, because all that reached the mix was the
+            # silence in front of it.
+            r = subprocess.run(
+                [FFMPEG, "-hide_banner", "-nostdin", "-v", "error",
+                 "-ss", "%.3f" % a0, "-t", "%.3f" % (a1 - a0),
+                 "-i", os.path.abspath(src_), "-vn",
+                 "-af", "%s,adelay=%d|%d" % (fade, int(at * 1000), int(at * 1000)),
+                 "-ac", "2", "-ar", "48000", wav],
+                capture_output=True, timeout=180,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if r.returncode == 0 and os.path.isfile(wav):
+                bleeds.append((wav, "L-cut" if is_head else "J-cut", round(a1 - a0, 2)))
+
     # --- music, pulled down wherever the room can be heard ---------------------
     music, mvol = a.get("music"), float(a.get("music_volume", 0.75))
     if music:
@@ -6583,8 +6667,21 @@ def t_montage(a):
                         "at": "%.2f" % max(0.0, last_at - 0.05)})
 
     cues = list(a.get("captions") or [])
+    title_at = min(1.1, total * 0.05)
+    beat_note = ""
+    if a.get("title") and music and a.get("align_title", True):
+        try:                       # land it on a beat of the actual score
+            env, rate = _onset_envelope(music)
+            bpm, beats = _beat_grid(env, rate)
+            near = [b for b in beats if 0.6 <= b <= 3.2]
+            if near:
+                title_at = min(near, key=lambda b: abs(b - title_at))
+                beat_note = ("title lands on a beat of the score (%.2fs, %.0f BPM) "
+                             "rather than on an arbitrary second" % (title_at, bpm))
+        except Exception:
+            pass
     if a.get("title"):
-        cues.insert(0, {"start": "%.2f" % min(1.1, total * 0.05),
+        cues.insert(0, {"start": "%.2f" % title_at,
                         "end": "%.2f" % min(5.4, total * 0.25),
                         "text": a["title"]})
     if a.get("closing"):
@@ -6671,6 +6768,27 @@ def t_montage(a):
             music, mvol = bedded, 1.0
         else:
             tone_note = ""
+    if bleeds:
+        mixed = os.path.join(tmp, "mg_withbleed_%d.wav" % tag)
+        ins, labs = [], []
+        for n, (w, _k, _d) in enumerate(bleeds):
+            ins += ["-i", w]
+            labs.append("[%d:a]volume=%.2f[b%d]" % (n, float(a.get("bleed_level", 0.9)), n))
+        base_i = len(bleeds)
+        if music:
+            ins += ["-i", os.path.abspath(music)]
+            labs.append("[%d:a]volume=%.3f[bed]" % (base_i, mvol))
+        srcs_ = "".join("[b%d]" % n for n in range(len(bleeds))) + ("[bed]" if music else "")
+        graph = ";".join(labs) + ";%samix=inputs=%d:duration=longest:normalize=0[o]" % (
+            srcs_, len(bleeds) + (1 if music else 0))
+        r = subprocess.run([FFMPEG, "-hide_banner", "-nostdin", "-v", "error"] + ins +
+                           ["-filter_complex", graph, "-map", "[o]", "-ar", "48000", mixed],
+                           capture_output=True, timeout=300,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if r.returncode == 0 and os.path.isfile(mixed):
+            music, mvol = mixed, 1.0
+        else:
+            bleeds = []
     if music:
         build["music"], build["music_volume"] = music, mvol
     msg = t_build(build)
@@ -6692,6 +6810,16 @@ def t_montage(a):
                      % (len(head_f) + len(tail_f), len(clips)))
     if sound_at and music:
         extra.append("music ducked under %d of them" % len(sound_at))
+    if bleeds:
+        extra.append("their own sound carried across %d cut(s) (%s) so the room does "
+                     "not stop dead when the photographs start"
+                     % (len(bleeds), ", ".join("%s %.1fs" % (k, d) for _w, k, d in bleeds)))
+    if beat_note:
+        extra.append(beat_note)
+    if _drift > 0.01 and _warm:
+        extra.append("colour drifts warmer across the film (%.2f to %.2f), so the "
+                     "ending feels warmer than the opening without looking graded"
+                     % (_warm * (1 - _drift), _warm * (1 + _drift)))
     if tone_note:
         extra.append(tone_note)
     if sfx and not a.get("sfx"):
@@ -8604,6 +8732,23 @@ TOOLS = [
                                             "invisible and effective; 1.0 is too much."},
                 "transition": {"type": "string"}, "fps": {"type": "integer"},
                 "target_lufs": {"type": "number"}, "true_peak": {"type": "number"},
+                "warmth_drift": {"type": "number",
+                                 "description": "0-1, default 0.45 when warmth is set. How "
+                                                "much cooler the opening is than the ending. "
+                                                "Felt rather than seen."},
+                "align_title": {"type": "boolean",
+                                "description": "Default true: the title appears on a beat of "
+                                               "the music, not on an arbitrary second."},
+                "title_motion": {"type": "boolean",
+                                 "description": "Default true: the opening title fades and "
+                                                "settles in rather than simply appearing."},
+                "audio_bleed": {"type": "number",
+                                "description": "Seconds of the clip's own sound carried "
+                                               "PAST the picture at the opening and BEFORE "
+                                               "it at the ending. Default 2.2. This is the "
+                                               "difference between a cut and an edit; 0 "
+                                               "turns it off."},
+                "bleed_level": {"type": "number", "description": "Default 0.9."},
                 "sound_design": {"type": "boolean",
                                  "description": "Default true: lays room tone taken from "
                                                 "your own clip under the photographs, so "
