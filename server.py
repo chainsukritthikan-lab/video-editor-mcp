@@ -5181,6 +5181,169 @@ def t_video_shape(a):
             image_content(out)]
 
 
+def t_clip_stretch(a):
+    """Every usable shot hiding inside a handful of clips.
+
+    Written for a hard constraint: three generated clips a day, eight seconds
+    each. Twenty-four seconds of material, and a thirty-second advert wants ten
+    to fourteen shots. Most of that footage is thrown away for want of looking at
+    it properly.
+
+    An eight-second take is not one shot. It is:
+      TWO SECTIONS   split at the moment the picture changes most - two different
+                     beats, not one long one.
+      A PUNCH-IN     cropped into the busiest part and eased. A tighter framing
+                     of the same instant reads as a SECOND CAMERA, and it is the
+                     single biggest return on footage you already have. It must
+                     be a real crop though: under about 1.4x the eye reads it as
+                     the same shot slightly bigger, which looks like a mistake.
+      A HELD BEAT    the strongest moment at half speed.
+      A FREEZE       the peak, stopped. Punctuation.
+      A REVERSE      only honest on some motion - a pour, a splash, a hand
+                     moving. Rendered and LABELLED as needing a look, because
+                     whether it reads as deliberate is not measurable.
+
+    Nothing here invents detail. It finds what is already in the frames.
+    """
+    paths = a.get("paths") or ([a["path"]] if a.get("path") else [])
+    if not paths:
+        raise ToolError("Give 'paths': the clips you have to work with.")
+    srcs = [check_input(p, "clip") for p in paths]
+    want = (a.get("kinds") or ["sections", "punch", "slow", "freeze"])
+    folder = a.get("folder") or os.path.join(
+        os.path.dirname(os.path.abspath(srcs[0])), "shots")
+    _mkdirs(folder)
+
+    shots, notes = [], []
+    for ci, src in enumerate(srcs):
+        total = video_duration_of(src)
+        base = re.sub(r"[^\w\-]+", "_", os.path.splitext(os.path.basename(src))[0])[:22]
+        cuts = []
+        try:
+            cuts = [c for c in _scene_cuts(src, 12.0) if 0.8 < c < total - 0.8]
+        except Exception:
+            pass
+        mid = cuts[0] if cuts else total * 0.52
+        peak = _busiest_moment(src) or total * 0.45
+
+        def out(tag):
+            return os.path.join(folder, "%s_%s.mp4" % (base, tag))
+
+        if "sections" in want and total >= 3.0:
+            for k, (x0, x1) in enumerate(((0.0, mid), (mid, total))):
+                if x1 - x0 < 1.0:
+                    continue
+                p = out("a" if k == 0 else "b")
+                ffmpeg_run(["-ss", "%.3f" % x0, "-i", src, "-t", "%.3f" % (x1 - x0)]
+                           + FAST_ENC + ["-c:a", "aac", p])
+                shots.append((p, "clip %d, seconds %.1f-%.1f" % (ci + 1, x0, x1),
+                              round(x1 - x0, 1)))
+        if "punch" in want:
+            p = out("punch")
+            try:
+                t_punch_in({"path": src, "at": round(max(0.2, peak - 0.6), 2),
+                            "zoom": float(a.get("punch_zoom", 1.6)),
+                            "hold": min(3.0, max(1.2, total * 0.35)),
+                            "ramp": 0.5, "output": p})
+                shots.append((p, "clip %d, punched in at %.1fs - reads as a second "
+                              "camera" % (ci + 1, peak), None))
+            except ToolError as e:
+                notes.append("punch-in on clip %d: %s" % (ci + 1, str(e)[:70]))
+        if "slow" in want:
+            src2 = out("beat_src")
+            ffmpeg_run(["-ss", "%.3f" % max(0.0, peak - 0.7), "-i", src, "-t", "1.4"]
+                       + FAST_ENC + ["-an", src2])
+            p = out("slow")
+            try:
+                t_smooth_slowmo({"path": src2, "factor": float(a.get("slow_factor", 0.5)),
+                                 "output": p})
+                shots.append((p, "clip %d, the strongest 1.4s at half speed"
+                              % (ci + 1), None))
+            except ToolError as e:
+                notes.append("slow motion on clip %d: %s" % (ci + 1, str(e)[:70]))
+            finally:
+                if os.path.isfile(src2):
+                    os.remove(src2)
+        if "freeze" in want:
+            p = out("freeze")
+            try:
+                t_freeze({"path": src, "at": round(peak, 2),
+                          "hold": float(a.get("freeze_hold", 0.7)), "output": p})
+                shots.append((p, "clip %d, frozen on the peak at %.1fs"
+                              % (ci + 1, peak), None))
+            except ToolError as e:
+                notes.append("freeze on clip %d: %s" % (ci + 1, str(e)[:70]))
+        if "reverse" in want:
+            p = out("reverse")
+            try:
+                t_reverse({"path": src, "keep_audio": False, "output": p})
+                shots.append((p, "clip %d REVERSED - look at this one, it only "
+                              "reads as deliberate on some motion" % (ci + 1), None))
+            except ToolError as e:
+                notes.append("reverse on clip %d: %s" % (ci + 1, str(e)[:70]))
+
+    if not shots:
+        raise ToolError("Could not make any shots from those clips.")
+
+    sheet = os.path.join(folder, "shots.png")
+    try:
+        tiles = []
+        tmp = _tmpdir()
+        for i, (p, _lab, _d) in enumerate(shots):
+            f = os.path.join(tmp, "cs_%d_%d.png" % (os.getpid(), i))
+            grab_frame(p, video_duration_of(p) * 0.45, f, width=250)
+            if os.path.isfile(f):
+                tiles.append(f)
+        if tiles:
+            lst = os.path.join(tmp, "cs_%d.txt" % os.getpid())
+            with io.open(lst, "w", encoding="utf-8") as fh:
+                for t in tiles:
+                    fh.write("file '%s'\n" % t.replace("\\", "/"))
+            cols = min(5, max(2, int(math.ceil(math.sqrt(len(tiles))))))
+            rows = int(math.ceil(len(tiles) / float(cols)))
+            ffmpeg_run(["-f", "concat", "-safe", "0", "-r", "1", "-i", lst,
+                        "-vf", "tile=%dx%d:padding=4:color=0x0b0e14" % (cols, rows),
+                        "-frames:v", "1", sheet])
+    except Exception:
+        sheet = None
+
+    lines = ["%d shot(s) out of %d clip(s) - %.0f seconds of footage."
+             % (len(shots), len(srcs), sum(video_duration_of(s) for s in srcs))]
+    for i, (p, lab, _d) in enumerate(shots, 1):
+        lines.append("  %2d. %-26s %s" % (i, os.path.basename(p)[:26], lab))
+    if notes:
+        lines.append("\n  Did not work: " + "; ".join(notes))
+    lines.append("\n  A thirty-second advert wants ten to fourteen shots. Do NOT use "
+                 "two that come from the same second of the same clip - they read as "
+                 "a repeat, not as coverage.")
+    lines.append("  -> %s" % folder)
+    if sheet and os.path.isfile(sheet):
+        return [{"type": "text", "text": "\n".join(lines)}, image_content(sheet)]
+    return "\n".join(lines)
+
+
+def _busiest_moment(src):
+    """When the most is happening - where a punch-in or a freeze should land."""
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    p = subprocess.run([FFMPEG, "-hide_banner", "-nostdin", "-v", "error", "-i", src,
+                        "-vf", "fps=8,scale=64:36,format=gray", "-f", "rawvideo", "-"],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    buf = np.frombuffer(p.stdout, dtype=np.uint8)
+    n = buf.size // (64 * 36)
+    if n < 6:
+        return None
+    fr = buf[:n * 64 * 36].reshape(n, -1).astype(np.float32)
+    mo = np.abs(np.diff(fr, axis=0)).mean(axis=1)
+    # a short rolling mean, so one flash frame does not win over a real move
+    k = min(5, max(2, len(mo) // 6))
+    sm = np.convolve(mo, np.ones(k) / k, mode="same")
+    return float(int(sm.argmax()) / 8.0)
+
+
 def t_font_library(a):
     """Every face in the library, showing YOUR words, so the choice is made by eye.
 
@@ -7423,18 +7586,30 @@ def t_punch_in(a):
     fx = float(a.get("focus_x", 0.5))
     fy = float(a.get("focus_y", 0.42))
 
-    t0, t1 = at, at + ramp
-    t2, t3 = at + ramp + hold, at + ramp + hold + ramp
+    # zoompan, NOT crop. crop only re-evaluates x and y per frame - its width and
+    # height are worked out once at initialisation, when t is 0, so a time-varying
+    # zoom collapses to 1 and the filter quietly does nothing at all. This tool
+    # shipped that way: the duration was right, the output size was right, and
+    # nobody put the two framings side by side. At zoom 2.0 the picture was
+    # identical to the source. crop has no eval option to fix it with, either.
+    #
+    # And zoompan must be told the SOURCE frame rate - hand it a constant and it
+    # relabels frames instead of resampling, which stretches the clip.
+    rate = fps_of(src) or 30.0
+    f = lambda secs: secs * rate
+    n0, n1 = f(at), f(at + ramp)
+    n2, n3 = f(at + ramp + hold), f(at + ramp + hold + ramp)
+    nr = max(1.0, f(ramp))
     # A smoothstep either side, so it accelerates and settles instead of stepping.
-    z = ("if(lt(t,%f),1,"
-         "if(lt(t,%f),1+%f*(3*pow((t-%f)/%f,2)-2*pow((t-%f)/%f,3)),"
-         "if(lt(t,%f),%f,"
-         "if(lt(t,%f),%f-%f*(3*pow((t-%f)/%f,2)-2*pow((t-%f)/%f,3)),1))))"
-         % (t0, t1, zoom - 1, t0, ramp, t0, ramp, t2, zoom, t3, zoom, zoom - 1,
-            t2, ramp, t2, ramp))
+    z = ("if(lt(on,%f),1,"
+         "if(lt(on,%f),1+%f*(3*pow((on-%f)/%f,2)-2*pow((on-%f)/%f,3)),"
+         "if(lt(on,%f),%f,"
+         "if(lt(on,%f),%f-%f*(3*pow((on-%f)/%f,2)-2*pow((on-%f)/%f,3)),1))))"
+         % (n0, n1, zoom - 1, n0, nr, n0, nr, n2, zoom, n3, zoom, zoom - 1,
+            n2, nr, n2, nr))
     ez = esc_expr(z)
-    vf = ("crop=w=iw/(%s):h=ih/(%s):x=(iw-iw/(%s))*%.4f:y=(ih-ih/(%s))*%.4f,"
-          "scale=%d:%d:flags=lanczos,setsar=1" % (ez, ez, ez, fx, ez, fy, w, h))
+    vf = ("zoompan=z='%s':d=1:x='(iw-iw/zoom)*%.4f':y='(ih-ih/zoom)*%.4f':"
+          "s=%dx%d:fps=%g,setsar=1" % (ez, fx, fy, w, h, rate))
     out = make_output(src, "punch", a.get("output"), ".mp4")
     ffmpeg_run(["-i", src, "-vf", vf] + VIDEO_ENC +
                (["-c:a", "copy"] if has_audio(src) else ["-an"]) + [out])
@@ -8602,6 +8777,35 @@ def t_voice_over(a):
 
 
 TOOLS = [
+    {
+        "name": "clip_stretch",
+        "description": "Every usable shot hiding inside a few clips. Built for a hard cap - "
+                       "three generated clips a day, eight seconds each - where a 30s advert "
+                       "wants ten to fourteen shots. An 8s take is not one shot: it is two "
+                       "sections, a punch-in that reads as a SECOND CAMERA, a held beat at "
+                       "half speed, a freeze on the peak, and sometimes a reverse. Renders "
+                       "them all and shows you a sheet so you can choose by eye.",
+        "handler": t_clip_stretch,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "paths": {"type": "array", "items": {"type": "string"},
+                          "description": "The clips you have."},
+                "path": {"type": "string", "description": "Or just one."},
+                "kinds": {"type": "array", "items":
+                          {"enum": ["sections", "punch", "slow", "freeze", "reverse"]},
+                          "description": "Default sections, punch, slow, freeze. Reverse is "
+                                         "off by default - it only reads as deliberate on "
+                                         "some motion and that cannot be measured."},
+                "punch_zoom": {"type": "number",
+                               "description": "Default 1.6. Below about 1.4 the eye reads it "
+                                              "as the same shot slightly bigger, which looks "
+                                              "like a mistake rather than a cut."},
+                "slow_factor": {"type": "number", "description": "Default 0.5."},
+                "freeze_hold": {"type": "number", "description": "Default 0.7s."},
+                "folder": {"type": "string"}},
+            "required": []},
+    },
     {
         "name": "font_library",
         "description": "Show every typeface in the library set in YOUR OWN words, at caption "
