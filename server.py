@@ -26,6 +26,13 @@ from concurrent.futures import ThreadPoolExecutor
 
 # ---------------------------------------------------------------- encoding
 # Windows default codepage (cp874 on Thai systems) mangles JSON. Force UTF-8.
+#
+# ANYTHING THAT IMPORTS THIS MODULE MUST NOT WRAP STDOUT ITSELF. This does it
+# here, and wrapping the same buffer twice means whichever wrapper is collected
+# first closes it underneath the other: the process dies with "I/O operation on
+# closed file. lost sys.stderr" before it can bind a port, which reads like a
+# crash in the importing program rather than like two layers fighting over one
+# stream. Cost an hour in the videomaker front end.
 sys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8", errors="replace")
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
