@@ -1772,6 +1772,11 @@ def t_smooth_slowmo(a):
 
 
 # ---------------------------------------------------------------- seeing the video
+def _mkdirs(d):
+    if d and not os.path.isdir(d):
+        os.makedirs(d, exist_ok=True)
+
+
 def _tmpdir():
     d = os.path.join(os.environ.get("TEMP", "."), "video_editor_mcp")
     os.makedirs(d, exist_ok=True)
@@ -6033,6 +6038,38 @@ def _photo_taken(path):
     return None
 
 
+def _quietest_span(src, length=4.0):
+    """The calmest stretch in a clip - where its room tone lives.
+
+    Not silence: a party recording has none. The quietest four seconds still hold
+    the fridge, the fan and the shape of the room, and that is exactly what is
+    missing from a photo montage. Wrong choice here and you loop somebody's
+    half-sentence under twenty photographs, so it is measured, not guessed at.
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    if not has_audio(src):
+        return None
+    raw = subprocess.run([FFMPEG, "-hide_banner", "-nostdin", "-v", "error",
+                          "-i", os.path.abspath(src), "-ac", "1", "-ar", "16000",
+                          "-f", "f32le", "-"],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600,
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+    x = np.frombuffer(raw, dtype="<f4").astype(np.float64)
+    step = 8000                                   # half a second
+    if len(x) < step * int(length * 2 + 2):
+        return None
+    rms = np.array([float(np.sqrt(np.mean(x[i:i + step] ** 2)) + 1e-9)
+                    for i in range(0, len(x) - step, step)])
+    span = max(2, int(length * 2))
+    cum = np.concatenate([[0.0], np.cumsum(rms)])
+    tot = cum[span:] - cum[:-span]
+    i = int(tot.argmin())
+    return (round(i * 0.5, 2), round(i * 0.5 + length, 2))
+
+
 def _loud_windows(src, want, length, gap=4.0):
     """The moments in a clip where something actually happens.
 
@@ -6234,6 +6271,31 @@ def t_montage(a):
 
     What it cannot judge is which photos to leave out, and it does not try.
     """
+    # A saved plan is the starting point; anything passed explicitly overrides it,
+    # so "same film but 2 seconds longer on the kiss" is one argument, not a
+    # rebuilt call.
+    if a.get("plan"):
+        pf = check_input(a["plan"], "plan")
+        with io.open(pf, encoding="utf-8") as fh:
+            saved = json.load(fh)
+        base = {"shape": saved.get("shape"), "fps": saved.get("fps"),
+                "transition": saved.get("transition"),
+                "transition_seconds": saved.get("transition_seconds"),
+                "title": saved.get("title"), "closing": saved.get("closing"),
+                "font": saved.get("font"), "font_scale": saved.get("font_scale"),
+                "accent": saved.get("accent"),
+                "margin_bottom": saved.get("margin_bottom"),
+                "order": "given",
+                "photos": [p["file"] for p in saved.get("photos") or []],
+                "seconds_each": [p["seconds"] for p in saved.get("photos") or []],
+                "clips": sorted(set(c["file"] for c in saved.get("clips") or [])),
+                "clip_moments": saved.get("clips") or []}
+        base.update(saved.get("look") or {})
+        base.update({k: v for k, v in (saved.get("sound") or {}).items() if v is not None})
+        for k, v in base.items():
+            if v is not None and k not in a:
+                a[k] = v
+
     photos = a.get("photos") or []
     if isinstance(photos, str) and os.path.isdir(photos):
         photos = [os.path.join(photos, f) for f in sorted(os.listdir(photos))
@@ -6373,16 +6435,37 @@ def t_montage(a):
         return out
 
     # --- what goes where ------------------------------------------------------
+    clips_for_tone = list(clips)
+    room_tone = None
     clip_len = float(a.get("clip_seconds", 13.0))
     tail_len = float(a.get("clip_tail_seconds", 3.7))
     heads, tails = [], []
+    saved_moments = a.get("clip_moments")
+    if saved_moments:
+        for m in saved_moments:
+            (heads if m.get("role") != "close" else tails).append(
+                (m["file"], float(m["start"]), float(m["end"])))
+        clips = []          # already decided - do not go looking again
     for src in clips:
         if a.get("clip_highlights", True) and has_audio(src):
-            picks = _loud_windows(src, 2, clip_len)
-            heads.append((src,) + picks[0])
-            if len(picks) > 1:
-                tails.append((src, picks[-1][0], min(picks[-1][0] + tail_len,
-                                                     video_duration_of(src))))
+            head = _loud_windows(src, 1, clip_len)[0]
+            heads.append((src,) + head)
+            # The closing beat has to be searched at ITS OWN length. Taking the
+            # second-best THIRTEEN-second window and keeping its first four
+            # seconds does not find the four-second moment - on the party clip it
+            # returned 27.5s of chatter and walked straight past the cheer at 49s,
+            # which is 6 dB above everything around it and the obvious ending.
+            dur = video_duration_of(src)
+            cands = _loud_windows(src, 4, tail_len)
+            after = [w for w in cands if w[0] >= head[1] + 1.0]
+            # Prefer a loud moment from AFTER the opening, and the latest of those.
+            # An ending comes from the end of the take: on the party clip the
+            # candidates were 1.5s, 9.0s, 18.0s and 48.5s, and only the last is
+            # the cheer everyone lets out when the cake is cut.
+            best = (after[-1] if after else
+                    ([w for w in cands if w[1] <= head[0] - 1.0] or [None])[-1])
+            if best:
+                tails.append((src, best[0], min(best[1], dur)))
         else:
             heads.append((src, 0.0, min(clip_len, video_duration_of(src))))
 
@@ -6447,6 +6530,58 @@ def t_montage(a):
                         % (e, max(0.1, total - 2.2)), ducked], check=True)
         music, mvol = ducked, 1.0
 
+    # --- sound design, kept deliberately small ---------------------------------
+    # A montage with music and nothing else has a hole in it: between the songs
+    # and the voices there is digital silence, which is the clearest sign nobody
+    # was in the room. Room tone taken from the party's own recording fills it,
+    # and it is the SAME room, which no synthesised hiss can be.
+    #
+    # Two accents at most. I cannot hear these, so I will not scatter them: what
+    # can be checked is that the level is low enough not to intrude, and that is
+    # all this claims.
+    sfx = list(a.get("sfx") or [])
+    tone_note = ""
+    # Room tone only earns its place where there is SILENCE to fill. Measured on
+    # the birthday film, which has music running throughout: the floor under the
+    # photographs was already -17.2 dB, tone was laid in at -40, and the floor
+    # afterwards was -17.8 - i.e. it did nothing at all, completely masked. A
+    # feature that cannot be heard should not be claimed, so it is now skipped
+    # whenever a music bed already covers the whole film, and says so.
+    tone_wanted = a.get("sound_design", True) and clips_for_tone
+    if tone_wanted and (a.get("music") or a.get("music_mood", "warm")) \
+            and float(a.get("music_volume", 0.75)) >= 0.35:
+        tone_wanted = False
+        tone_note = ("room tone skipped - the music bed already runs the whole film, "
+                     "so tone under it is inaudible. It is for a montage with gaps")
+    if tone_wanted:
+        src = clips_for_tone[0]
+        quiet = _quietest_span(src, 4.0)
+        tone_note = ""
+        if quiet:
+            tone = os.path.join(tmp, "mg_tone_%d.wav" % tag)
+            q = subprocess.run(
+                [FFMPEG, "-hide_banner", "-nostdin", "-v", "error",
+                 "-ss", "%.2f" % quiet[0], "-i", os.path.abspath(src),
+                 "-t", "%.2f" % (quiet[1] - quiet[0]), "-vn",
+                 "-af", "highpass=f=60,lowpass=f=7000,afade=t=in:st=0:d=0.6,"
+                        "afade=t=out:st=%.2f:d=0.6,loudnorm=I=-40:TP=-20"
+                        % max(0.1, (quiet[1] - quiet[0]) - 0.6),
+                 "-ac", "2", "-ar", "48000", tone],
+                capture_output=True, timeout=180,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if q.returncode == 0 and os.path.isfile(tone):
+                room_tone = tone
+                tone_note = ("room tone lifted from the party's own recording "
+                             "(%.1f-%.1fs, its quietest stretch) laid under the "
+                             "photographs at -40 LUFS" % quiet)
+    if a.get("sound_design", True) and not a.get("sfx"):
+        if len(marks) > len(head_f):
+            sfx.append({"sound": "reveal", "gain": 0.35,
+                        "at": "%.2f" % max(0.0, marks[len(head_f)] - 0.12)})
+        if last_at > 1.0:
+            sfx.append({"sound": "sparkle", "gain": 0.28,
+                        "at": "%.2f" % max(0.0, last_at - 0.05)})
+
     cues = list(a.get("captions") or [])
     if a.get("title"):
         cues.insert(0, {"start": "%.2f" % min(1.1, total * 0.05),
@@ -6456,6 +6591,44 @@ def t_montage(a):
         cues.append({"start": "%.2f" % (last_at + 0.55),
                      "end": "%.2f" % max(last_at + 1.2, total - 0.35),
                      "text": a["closing"]})
+
+    # --- the plan, written down so the next change is one line -----------------
+    # Every small change used to mean rebuilding the whole call from scratch, and
+    # that is why an edit took six minutes rather than one. Cheap iteration is how
+    # an edit actually gets good: five versions tried beats one version reasoned
+    # about. So the resolved plan - what was chosen, not what was asked for -
+    # comes back out in a form that can be edited and fed straight back in.
+    plan = {
+        "version": 1,
+        "shape": shape, "width": cw, "height": ch, "fps": fps,
+        "transition_seconds": xf, "transition": a.get("transition") or "fade",
+        "photos": [{"file": p, "seconds": round(dur_of(i), 3)}
+                   for i, p in enumerate(photos)],
+        "clips": ([{"file": s_, "start": round(x, 3), "end": round(b, 3), "role": "open"}
+                   for s_, x, b in heads] +
+                  [{"file": s_, "start": round(x, 3), "end": round(b, 3), "role": "close"}
+                   for s_, x, b in tails]),
+        "title": a.get("title"), "closing": a.get("closing"),
+        "font": a.get("font") or "TH Baijam",
+        "font_scale": float(a.get("font_scale", 3.5)),
+        "accent": a.get("accent") or "#ffd479",
+        "margin_bottom": float(a.get("margin_bottom", 0.055)),
+        "look": {"warmth": float(a.get("warmth", 0.0)),
+                 "contrast": float(a.get("contrast", 0.0)),
+                 "vignette": float(a.get("vignette", 0.0)),
+                 "grain": float(a.get("grain", 0.20)),
+                 "saturation": float(a.get("saturation", 1.06)),
+                 "match_exposure": bool(a.get("match_exposure", True))},
+        "sound": {"music": a.get("music"), "music_mood": a.get("music_mood"),
+                  "music_volume": float(a.get("music_volume", 0.75)),
+                  "music_duck": float(a.get("music_duck", 0.20))},
+    }
+    plan_path = a.get("save_plan")
+    if plan_path:
+        plan_path = os.path.abspath(plan_path)
+        _mkdirs(os.path.dirname(plan_path))
+        with io.open(plan_path, "w", encoding="utf-8") as fh:
+            json.dump(plan, fh, ensure_ascii=False, indent=1)
 
     build = {"paths": pieces, "transition": a.get("transition") or "fade",
              "duration": xf, "audio_crossfade": xf, "fps": fps,
@@ -6474,6 +6647,30 @@ def t_montage(a):
              "output": make_output(photos[0], "montage", a.get("output"), ".mp4")}
     if cues:
         build["captions"] = cues
+    if sfx:
+        build["sfx"] = sfx
+    if room_tone:
+        # Underneath the music, not mixed into it: the bed gets ducked under the
+        # clips and the room should not duck with it - it is what the clips ARE.
+        bedded = os.path.join(tmp, "mg_bed_tone_%d.wav" % tag)
+        n_loops = int(total / max(1.0, duration_of(room_tone))) + 2
+        rc = subprocess.run(
+            [FFMPEG, "-hide_banner", "-nostdin", "-v", "error",
+             "-stream_loop", str(n_loops), "-i", room_tone] +
+            (["-i", os.path.abspath(music)] if music else []) +
+            ["-filter_complex",
+             ("[0:a]atrim=0:%.2f,volume=%.3f[t];[1:a]volume=%.3f[m];"
+              "[t][m]amix=inputs=2:duration=longest:normalize=0[o]"
+              % (total, float(a.get("room_tone_level", 0.5)), mvol)) if music else
+             ("[0:a]atrim=0:%.2f,volume=%.3f[o]"
+              % (total, float(a.get("room_tone_level", 0.5)))),
+             "-map", "[o]", "-ar", "48000", bedded],
+            capture_output=True, timeout=300,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if rc.returncode == 0 and os.path.isfile(bedded):
+            music, mvol = bedded, 1.0
+        else:
+            tone_note = ""
     if music:
         build["music"], build["music_volume"] = music, mvol
     msg = t_build(build)
@@ -6495,6 +6692,11 @@ def t_montage(a):
                      % (len(head_f) + len(tail_f), len(clips)))
     if sound_at and music:
         extra.append("music ducked under %d of them" % len(sound_at))
+    if tone_note:
+        extra.append(tone_note)
+    if sfx and not a.get("sfx"):
+        extra.append("%d quiet accent(s) placed - I cannot hear these, only "
+                     "confirm they sit well below the music" % len(sfx))
     return msg + "\n  " + "; ".join(extra) + "."
 
 
@@ -8402,8 +8604,29 @@ TOOLS = [
                                             "invisible and effective; 1.0 is too much."},
                 "transition": {"type": "string"}, "fps": {"type": "integer"},
                 "target_lufs": {"type": "number"}, "true_peak": {"type": "number"},
+                "sound_design": {"type": "boolean",
+                                 "description": "Default true: lays room tone taken from "
+                                                "your own clip under the photographs, so "
+                                                "the quiet parts sound like the room rather "
+                                                "than like digital silence, and places two "
+                                                "quiet accents. False for music only."},
+                "room_tone_level": {"type": "number", "description": "Default 0.5."},
+                "sfx": {"type": "array", "description": "Your own [{sound, at, gain}]. "
+                                                        "Replaces the automatic accents.",
+                        "items": {"type": "object", "properties": {
+                            "sound": {"type": "string"}, "at": {"type": "string"},
+                            "gain": {"type": "number"}}}},
+                "save_plan": {"type": "string",
+                              "description": "Write the resolved plan here as JSON - what "
+                                             "was actually chosen, photo by photo. Feed it "
+                                             "back with `plan` to re-render, so changing "
+                                             "one hold is one number instead of a rebuilt "
+                                             "call."},
+                "plan": {"type": "string",
+                         "description": "A plan saved earlier. Anything else you pass "
+                                        "overrides it."},
                 "output": {"type": "string"}},
-            "required": ["photos"]},
+            "required": []},
     },
     {
         "name": "video_build",
