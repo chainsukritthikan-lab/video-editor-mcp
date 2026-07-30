@@ -2445,30 +2445,54 @@ SUBTITLE_FONTS = {
     "TH Chakra Petch": dict(fits=23, size=0.85, note="geometric, contemporary"),
     "TH Krub":         dict(fits=20, size=0.76, note="clean modern sans"),
     "TH Baijam":       dict(fits=22, size=0.85, note="rounded, friendly"),
-    "TH Fahkwang":     dict(fits=22, size=0.97, note="squarish, a little editorial"),
+    # The family name really does have a space in it. Registered as "TH Fahkwang"
+    # it silently fell back to another face - libass never says which font it
+    # could not find, so the caption just quietly came out in something else.
+    "TH Fah kwang":    dict(fits=22, size=0.97, note="squarish, a little editorial"),
     "TH K2D July8":    dict(fits=22, size=0.85, note="geometric, wide counters"),
     "TH KoHo":         dict(fits=22, size=0.86, note="humanist sans, warm"),
     "TH Kodchasal":    dict(fits=29, size=1.08, note="narrow, fits a lot per line"),
-    "TH Mali Grade6":  dict(fits=22, size=0.97, note="soft rounded, childlike"),
+    "TH Mali Grade 6": dict(fits=22, size=0.97, note="soft rounded, childlike"),
     "TH Niramit AS":   dict(fits=31, size=1.07, note="compact text face, economical"),
-    # --- downloaded from Google Fonts (OFL, free for commercial use) -------------
-    # These are what Thai social media actually uses; the pre-installed set above
-    # is the National Font collection, which is excellent and looks like a
-    # government document. fits and size measured by rendering against Tahoma.
-    "Kanit":           dict(fits=19, size=1.01, note="the Thai social standard - bold, modern"),
-    "Prompt":          dict(fits=18, size=0.99, note="geometric, clean, very current"),
-    "Mitr":            dict(fits=19, size=1.00, note="rounded and friendly, warm"),
-    "Athiti":          dict(fits=20, size=1.02, note="quiet sans, gets out of the way"),
-    "Bai Jamjuree":    dict(fits=18, size=0.84, note="wide and sturdy, strong on video"),
-    "Pridi":           dict(fits=20, size=0.98, note="serif - editorial, grown-up"),
-    "Itim":            dict(fits=19, size=0.92, note="handwritten, casual and sweet"),
-    "Sriracha":        dict(fits=19, size=0.80, note="brush handwriting - personal, informal"),
-    "Chonburi":        dict(fits=15, size=0.87, note="heavy slab display - titles only"),
-    "Pattaya":         dict(fits=22, size=0.89, note="condensed display - titles only"),
+    # --- bundled from Google Fonts (all SIL OFL, safe on commercial work) --------
+    # The pre-installed set above is the Thai National Font collection: excellent,
+    # and it looks like a government document. These are what Thai social media
+    # actually sets captions in, plus Latin faces for English titles on the brand
+    # work. fits and size measured by rendering against Tahoma; `thai` comes from
+    # the font's own cmap, NOT from looking at a render - a face without Thai
+    # draws notdef boxes that any pixel test happily counts as ink, which is how
+    # Kavivanar nearly got shipped as a Thai face with zero Thai glyphs in it.
+    "Kanit":         dict(fits=19, size=1.01, thai=True,  kind="caption", note="the Thai social standard - bold, modern"),
+    "Prompt":        dict(fits=18, size=0.99, thai=True,  kind="caption", note="geometric, clean, very current"),
+    "Mitr":          dict(fits=19, size=1.00, thai=True,  kind="caption", note="rounded and friendly, warm"),
+    "Athiti":        dict(fits=20, size=1.02, thai=True,  kind="caption", note="quiet sans, gets out of the way"),
+    "Bai Jamjuree":  dict(fits=18, size=0.84, thai=True,  kind="caption", note="wide and sturdy, strong on video"),
+    "Noto Sans Thai":dict(fits=20, size=0.97, thai=True,  kind="caption", note="neutral workhorse, never wrong"),
+    "Pridi":         dict(fits=20, size=0.98, thai=True,  kind="caption", note="serif - editorial, grown-up"),
+    "Taviraj":       dict(fits=18, size=0.83, thai=True,  kind="caption", note="serif with contrast, elegant"),
+    "Trirong":       dict(fits=19, size=0.83, thai=True,  kind="caption", note="serif, formal and calm"),
+    "Maitree":       dict(fits=18, size=0.87, thai=True,  kind="caption", note="soft serif, easy to read long"),
+    "Itim":          dict(fits=19, size=0.92, thai=True,  kind="hand",    note="handwritten, casual and sweet"),
+    "Sriracha":      dict(fits=19, size=0.80, thai=True,  kind="hand",    note="brush handwriting - personal"),
+    "Charm":         dict(fits=22, size=0.57, thai=True,  kind="hand",    note="loose script - titles only"),
+    "Chonburi":      dict(fits=15, size=0.87, thai=True,  kind="title",   note="heavy slab display - titles only"),
+    "Pattaya":       dict(fits=22, size=0.89, thai=True,  kind="title",   note="condensed display - titles only"),
+    # Latin only. Naming one of these in a Thai caption is the worst outcome:
+    # libass falls back per glyph, so Thai words and Latin digits come out in two
+    # different typefaces and it reads as a mistake rather than a choice.
+    "Bebas Neue":    dict(fits=19, size=1.41, thai=False, kind="title",   note="condensed caps - punchy English titles"),
+    "Anton":         dict(fits=16, size=0.96, thai=False, kind="title",   note="very heavy English display"),
+    "Archivo Black": dict(fits=11, size=1.08, thai=False, kind="title",   note="blunt, wide, loud"),
+    "Oswald":        dict(fits=17, size=1.02, thai=False, kind="title",   note="condensed, newsy"),
+    "Montserrat":    dict(fits=12, size=1.10, thai=False, kind="caption", note="clean geometric English"),
+    "Poppins":       dict(fits=12, size=0.95, thai=False, kind="caption", note="round geometric, friendly"),
+    "Playfair Display": dict(fits=13, size=1.05, thai=False, kind="title", note="high-contrast serif, luxury"),
+    "Lobster":       dict(fits=15, size=1.01, thai=False, kind="hand",    note="retro script - logos, titles"),
+    "Kavivanar":     dict(fits=15, size=0.91, thai=False, kind="hand",    note="informal - LATIN ONLY despite the name"),
     # --- display faces: titles and end cards, too fussy for running captions -----
-    "TH Charm of AU":  dict(fits=30, size=0.63, note="display, ornamental - titles only"),
-    "TH Charmonman":   dict(fits=38, size=0.94, note="handwriting script - titles only"),
-    "TH Srisakdi":     dict(fits=45, size=0.96, note="condensed display - titles only"),
+    "TH Charm of AU":  dict(fits=30, size=0.63, kind="title", note="display, ornamental - titles only"),
+    "TH Charmonman":   dict(fits=38, size=0.94, kind="hand", note="handwriting script - titles only"),
+    "TH Srisakdi":     dict(fits=45, size=0.96, kind="title", note="condensed display - titles only"),
 }
 # Thai character widths vary, and the measurement used one sample string, so keep
 # a margin rather than sitting exactly on the limit.
@@ -2498,6 +2522,72 @@ def subtitles_arg(name):
     if os.path.isdir(BUNDLED_FONTS):
         return "subtitles=%s:fontsdir='%s'" % (name, escape_filter_path(BUNDLED_FONTS))
     return "subtitles=%s" % name
+
+
+_FONT_FILE_CACHE = {}
+
+
+def _font_file(family):
+    """The file for a family name - bundled OR installed on this machine.
+
+    Both have to be searched. Half the registered faces are the Thai National set
+    that came with Windows, and a font browser that can only draw the ones it
+    downloaded is no use for choosing between them.
+
+    Bundled wins on a name clash, since that is the copy libass will be pointed at.
+    Regular weights are preferred over italics and light cuts: a family's plain
+    face is what the caption will actually use.
+    """
+    if not _FONT_FILE_CACHE:
+        try:
+            from PIL import ImageFont
+        except ImportError:
+            _FONT_FILE_CACHE["__scanned__"] = ""
+            return None
+        dirs = [os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                             "Microsoft", "Windows", "Fonts"),
+                os.path.join(os.environ.get("WINDIR", "C:/Windows"), "Fonts")]
+        rank = lambda st: (("italic" in st.lower()) * 4 +
+                           any(w in st.lower() for w in ("light", "thin", "extra")) * 2 +
+                           (st.lower() not in ("regular", "bold", "semibold", "medium")))
+        for d in dirs:                       # system first...
+            for f in (globmod.glob(os.path.join(d, "*.ttf")) +
+                      globmod.glob(os.path.join(d, "*.otf"))):
+                try:
+                    fam, style = ImageFont.truetype(f, 20).getname()
+                except Exception:
+                    continue
+                prev = _FONT_FILE_CACHE.get(fam)
+                if prev is None or rank(style) < rank(prev[1]):
+                    _FONT_FILE_CACHE[fam] = (f, style)
+        for f in globmod.glob(os.path.join(BUNDLED_FONTS, "*.ttf")):
+            try:                             # ...bundled last, so it wins
+                _FONT_FILE_CACHE[ImageFont.truetype(f, 20).getname()[0]] = (f, "bundled")
+            except Exception:
+                pass
+        _FONT_FILE_CACHE["__scanned__"] = ("", "")
+    hit = _FONT_FILE_CACHE.get(family)
+    return hit[0] if hit else None
+
+
+def check_font_for(font, text):
+    """Refuse a Latin-only face on Thai words, rather than let it half-render.
+
+    libass falls back GLYPH BY GLYPH, so a Latin face asked for Thai produces the
+    words in a substitute typeface and the digits in the chosen one. It looks like
+    a bug in the edit, and nothing in the output says which font was missing.
+    """
+    meta = SUBTITLE_FONTS.get(font or "")
+    if not meta or meta.get("thai") is not False:
+        return
+    if any(u"ก" <= c <= u"๛" for c in (text or "")):
+        ok = sorted(n for n, m in SUBTITLE_FONTS.items()
+                    if m.get("thai") is not False
+                    and (m.get("kind") or "caption") == (meta.get("kind") or "caption"))
+        raise ToolError("“%s” has no Thai glyphs - it is a Latin-only face, so Thai "
+                        "words would come out in a substitute typeface while the "
+                        "numbers stayed in this one.\n  For %s work in Thai, try: %s"
+                        % (font, meta.get("kind", "caption"), ", ".join(ok[:6])))
 
 
 def caption_width_for(font, base=16):
@@ -5066,6 +5156,112 @@ def t_video_shape(a):
             image_content(out)]
 
 
+def t_font_library(a):
+    """Every face in the library, showing YOUR words, so the choice is made by eye.
+
+    A list of font names is useless - nobody can picture what "Taviraj" looks like
+    set in Thai at caption size over a photograph. This renders the actual text,
+    at the actual size, and where a frame is given, over the actual footage.
+
+    It also refuses to pretend. Nine of these faces have no Thai glyphs at all,
+    which is the one mistake that really spoils a caption: libass falls back per
+    GLYPH, so Thai words and Latin digits come out in two different typefaces and
+    it reads as a fault rather than a choice.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    text = a.get("text") or u"\u0e2a\u0e38\u0e02\u0e2a\u0e31\u0e19\u0e15\u0e4c\u0e27\u0e31\u0e19\u0e40\u0e01\u0e34\u0e14"
+    kind = (a.get("kind") or "all").lower()
+    if kind not in ("all", "caption", "title", "hand"):
+        raise ToolError("kind must be all, caption, title or hand.")
+    want_thai = a.get("thai")
+    if want_thai is None:
+        want_thai = any(u"\u0e01" <= c <= u"\u0e5b" for c in text)
+
+    names = []
+    for fam, meta in SUBTITLE_FONTS.items():
+        if kind != "all" and (meta.get("kind") or "caption") != kind:
+            continue
+        if want_thai and meta.get("thai") is False:
+            continue
+        names.append(fam)
+    if not names:
+        raise ToolError("No font matches that filter.")
+    names.sort(key=lambda n: ((SUBTITLE_FONTS[n].get("kind") or "caption"), n))
+
+    tmp = _tmpdir()
+    bg = a.get("over")
+    W, TILE_H, PAD = 620, 190, 30
+    if bg:
+        bg = check_input(bg, "image or video")
+        frame = os.path.join(tmp, "fl_bg_%d.png" % os.getpid())
+        at = float(a.get("at", 1.0))
+        if os.path.splitext(bg)[1].lower() in (".mp4", ".mov", ".mkv", ".webm", ".avi"):
+            subprocess.run([FFMPEG, "-hide_banner", "-nostdin", "-v", "error",
+                            "-ss", "%.2f" % at, "-i", bg, "-frames:v", "1", frame],
+                           capture_output=True, timeout=120,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        else:
+            frame = bg
+        base = Image.open(frame).convert("RGB")
+        base = base.crop((0, int(base.height * 0.55), base.width,
+                          min(base.height, int(base.height * 0.55) + int(base.width * 0.30))))
+        base = base.resize((W, TILE_H - 34), Image.LANCZOS)
+    else:
+        base = None
+
+    label = ImageFont.truetype("C:/Windows/Fonts/tahomabd.ttf", 21)
+    small = ImageFont.truetype("C:/Windows/Fonts/tahoma.ttf", 17)
+    tiles = []
+    for fam in names:
+        meta = SUBTITLE_FONTS[fam]
+        path = _font_file(fam)
+        tile = Image.new("RGB", (W, TILE_H), (13, 16, 22))
+        if base is not None:
+            tile.paste(base.copy(), (0, 34))
+        d = ImageDraw.Draw(tile)
+        d.text((10, 5), fam, font=label, fill=(255, 214, 120))
+        d.text((10 + int(d.textlength(fam, font=label)) + 14, 8),
+               "%s  ·  %s" % (meta.get("kind", "caption"), meta.get("note", ""))[:66],
+               font=small, fill=(132, 143, 156))
+        if path:
+            px = int(58 * float(meta.get("size", 1.0)))
+            try:
+                fnt = ImageFont.truetype(path, px)
+                bb = d.textbbox((0, 0), text, font=fnt)
+                x = (W - (bb[2] - bb[0])) // 2
+                y = 34 + (TILE_H - 34 - (bb[3] - bb[1])) // 2 - bb[1]
+                for dx, dy in ((-3, 0), (3, 0), (0, -3), (0, 3), (-2, -2), (2, 2)):
+                    d.text((x + dx, y + dy), text, font=fnt, fill=(20, 20, 24))
+                d.text((x, y), text, font=fnt, fill=(255, 255, 255))
+            except Exception:
+                d.text((14, 80), "could not render", font=label, fill=(248, 81, 73))
+        else:
+            d.text((14, 80), "installed on this PC - not bundled",
+                   font=small, fill=(132, 143, 156))
+        tiles.append(tile)
+
+    cols = 2 if len(tiles) > 6 else 1
+    rows = (len(tiles) + cols - 1) // cols
+    sheet = Image.new("RGB", (cols * (W + 8) - 8, rows * (TILE_H + 8) - 8), (8, 10, 15))
+    for i, t in enumerate(tiles):
+        sheet.paste(t, ((i % cols) * (W + 8), (i // cols) * (TILE_H + 8)))
+    out = make_output(names[0] + ".png", "fonts", a.get("output"), ".png")
+    sheet.save(out)
+
+    hidden = [n for n, m in SUBTITLE_FONTS.items() if want_thai and m.get("thai") is False]
+    note = ["%d font(s) shown, set in your own words." % len(names)]
+    if hidden:
+        note.append("  %d Latin-only face(s) left out because the text is Thai: %s. "
+                    "Naming one of those for a Thai caption makes libass fall back "
+                    "glyph by glyph, so the words and the numbers come out in "
+                    "different typefaces." % (len(hidden), ", ".join(sorted(hidden))))
+    note.append("  Filter with kind: caption / title / hand, and pass `over` to set "
+                "them on a real frame from your own footage.")
+    return [{"type": "text", "text": "\n".join(note) + "\n  -> " + out},
+            image_content(out, max_w=1500)]
+
+
 def t_music_describe(a):
     """What a piece of music actually IS - so a choice can be judged, not guessed.
 
@@ -7284,6 +7480,8 @@ def t_build(a):
         payload = _cues_from_text(cues, total, timer)
         if payload:
             font = a.get("font") or "Tahoma"
+            check_font_for(font, " ".join(
+                (c.get("text") or "") for c in cues if isinstance(c, dict)))
             ass_name = "build_%d.ass" % os.getpid()
             with io.open(os.path.join(tmp, ass_name), "w", encoding="utf-8-sig") as fh:
                 fh.write(_kinetic_ass_text(a, payload, w, h, font))
@@ -8043,6 +8241,32 @@ def t_voice_over(a):
 
 
 TOOLS = [
+    {
+        "name": "font_library",
+        "description": "Show every typeface in the library set in YOUR OWN words, at caption "
+                       "size, optionally over a real frame from your footage - because a list "
+                       "of font names tells you nothing about how they look in Thai. 39 faces: "
+                       "the Thai National set, the Google Thai faces social media actually "
+                       "uses, and Latin display faces for English titles. Filter by kind "
+                       "(caption / title / hand). Latin-only faces are hidden when the text "
+                       "is Thai, and named so you know why.",
+        "handler": t_font_library,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string",
+                         "description": "The words to set. Defaults to a Thai sample."},
+                "kind": {"enum": ["all", "caption", "title", "hand"]},
+                "thai": {"type": "boolean",
+                         "description": "Force the Thai filter on or off. Detected from the "
+                                        "text if left out."},
+                "over": {"type": "string",
+                         "description": "An image or video to set the words over, so they are "
+                                        "judged against real footage."},
+                "at": {"type": "number", "description": "Seconds into that video."},
+                "output": {"type": "string"}},
+            "required": []},
+    },
     {
         "name": "video_shape",
         "description": "LOOK at the SHAPE of a finished film - pacing, brightness, motion "
