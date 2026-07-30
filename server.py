@@ -2451,6 +2451,20 @@ SUBTITLE_FONTS = {
     "TH Kodchasal":    dict(fits=29, size=1.08, note="narrow, fits a lot per line"),
     "TH Mali Grade6":  dict(fits=22, size=0.97, note="soft rounded, childlike"),
     "TH Niramit AS":   dict(fits=31, size=1.07, note="compact text face, economical"),
+    # --- downloaded from Google Fonts (OFL, free for commercial use) -------------
+    # These are what Thai social media actually uses; the pre-installed set above
+    # is the National Font collection, which is excellent and looks like a
+    # government document. fits and size measured by rendering against Tahoma.
+    "Kanit":           dict(fits=19, size=1.01, note="the Thai social standard - bold, modern"),
+    "Prompt":          dict(fits=18, size=0.99, note="geometric, clean, very current"),
+    "Mitr":            dict(fits=19, size=1.00, note="rounded and friendly, warm"),
+    "Athiti":          dict(fits=20, size=1.02, note="quiet sans, gets out of the way"),
+    "Bai Jamjuree":    dict(fits=18, size=0.84, note="wide and sturdy, strong on video"),
+    "Pridi":           dict(fits=20, size=0.98, note="serif - editorial, grown-up"),
+    "Itim":            dict(fits=19, size=0.92, note="handwritten, casual and sweet"),
+    "Sriracha":        dict(fits=19, size=0.80, note="brush handwriting - personal, informal"),
+    "Chonburi":        dict(fits=15, size=0.87, note="heavy slab display - titles only"),
+    "Pattaya":         dict(fits=22, size=0.89, note="condensed display - titles only"),
     # --- display faces: titles and end cards, too fussy for running captions -----
     "TH Charm of AU":  dict(fits=30, size=0.63, note="display, ornamental - titles only"),
     "TH Charmonman":   dict(fits=38, size=0.94, note="handwriting script - titles only"),
@@ -2459,6 +2473,31 @@ SUBTITLE_FONTS = {
 # Thai character widths vary, and the measurement used one sample string, so keep
 # a margin rather than sitting exactly on the limit.
 CAPTION_SAFETY = 0.88
+
+
+BUNDLED_FONTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+
+
+def subtitles_arg(name):
+    r"""subtitles=..., pointed at the bundled fonts as well as the system ones.
+
+    fontsdir means the downloaded faces work without being installed - nothing is
+    written to the machine, and the connector still renders the same on a PC that
+    has never seen them. libass silently falls back to a default face when it
+    cannot find the one named, which looks like the style was ignored rather than
+    like a missing font, so this is worth getting right.
+
+    The path must be BOTH escaped and single-quoted. Tested all three forms on a
+    path that has a drive letter and a space in it:
+        fontsdir=C\:/...          -> "No option name near 'Prog...'"
+        fontsdir='C:/...'         -> "No option name near '/Users...'"
+        fontsdir='C\:/...'        -> works
+    An escaped colon on its own still ends the option, and quotes on their own do
+    not protect the drive letter. This has now bitten in five separate filters.
+    """
+    if os.path.isdir(BUNDLED_FONTS):
+        return "subtitles=%s:fontsdir='%s'" % (name, escape_filter_path(BUNDLED_FONTS))
+    return "subtitles=%s" % name
 
 
 def caption_width_for(font, base=16):
@@ -3088,7 +3127,7 @@ def _render_kinetic_ass(a, src, payload, w, h, total, font, out, text_only=False
     # it a bare filename from the file's own directory.
     cwd, name = os.path.dirname(ass), os.path.basename(ass)
     ff = ["ffmpeg", "-y", "-v", "error", "-i", os.path.abspath(src),
-          "-vf", "subtitles=%s" % name, "-c:a", "copy"] + VIDEO_ENC + \
+          "-vf", subtitles_arg(name), "-c:a", "copy"] + VIDEO_ENC + \
          ["-movflags", "+faststart", os.path.abspath(out)]
     p = subprocess.run(ff, cwd=cwd, capture_output=True, text=True)
     try:
@@ -6984,7 +7023,7 @@ def t_lower_third(a):
         fh.write("\n".join(head + ev) + "\n")
     out = make_output(src, "lower3", a.get("output"), ".mp4")
     p = subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", os.path.abspath(src),
-                        "-vf", "subtitles=%s" % os.path.basename(ass), "-c:a", "copy"] +
+                        "-vf", subtitles_arg(os.path.basename(ass)), "-c:a", "copy"] +
                        VIDEO_ENC + [os.path.abspath(out)],
                        cwd=os.path.dirname(ass), capture_output=True, text=True)
     try:
@@ -7248,7 +7287,7 @@ def t_build(a):
             ass_name = "build_%d.ass" % os.getpid()
             with io.open(os.path.join(tmp, ass_name), "w", encoding="utf-8-sig") as fh:
                 fh.write(_kinetic_ass_text(a, payload, w, h, font))
-            vchain.append("subtitles=%s" % ass_name)
+            vchain.append(subtitles_arg(ass_name))
 
     parts.append("%s%s[outv]" % (cur, ",".join(vchain) if vchain else "null"))
     n_vparts = len(parts)   # everything after this is audio, and the loudness

@@ -1,0 +1,12 @@
+These ten Thai typefaces come from Google Fonts and are all under the
+SIL Open Font License 1.1 - free to use, including commercially, including
+embedded in video. No attribution is required in the film itself.
+
+  Kanit, Prompt, Mitr, Athiti, Bai Jamjuree, Pridi, Itim, Sriracha
+  by Cadson Demak.  Chonburi, Pattaya also by Cadson Demak.
+
+Full licence: https://scripts.sil.org/OFL
+Source:      https://github.com/google/fonts
+
+They are used from this folder via libass fontsdir - nothing was installed on
+the machine, and nothing needs to be for the connector to render them.
