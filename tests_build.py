@@ -7,7 +7,7 @@ along with it (which made it fail silently and land a dB off), and captions
 quietly not being burned at all.
 """
 import os, sys, io, json, subprocess
-sys.path.insert(0, "C:/Users/Computer/Downloads/cluade code/video-editor-mcp")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import server
 
 o = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")

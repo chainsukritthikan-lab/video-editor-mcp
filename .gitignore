@@ -16,3 +16,7 @@ presets.json
 
 # Your real numbers, from your accounts. Nobody else's business.
 performance.json
+
+# local backups taken while editing
+*.bak*
+server.py.bak*

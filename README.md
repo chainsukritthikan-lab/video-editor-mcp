@@ -1,6 +1,7 @@
 # Video Editor Connector (free, local)
 
-A connector that lets Claude edit your videos by just asking in chat.
+A connector that lets Claude edit your videos by just asking in chat — 90 tools, and one
+command that turns raw clips into a cut that doesn't look automated.
 
 - **Free forever** — no API key, no subscription, no credits.
 - **Runs on your PC** — your videos are never uploaded anywhere.
@@ -8,6 +9,84 @@ A connector that lets Claude edit your videos by just asking in chat.
 
 Originals are **never modified**. Every result is saved into an `edited` folder
 next to the source video.
+
+---
+
+## Raw clips in, a cut that doesn't look automated
+
+```
+video_human_edit(paths=["shot1.mp4", "shot2.mp4", "shot3.mp4"],
+                 names=["Your Shop Name", "product"],
+                 script="the lines that are actually said, if you have them")
+```
+
+`names` are kept whole on one caption card and coloured. `script` is optional; when
+given, captions take its spelling and keep the speech recogniser's timing — the only
+way to catch a mishearing that is still two real words.
+
+Most auto-editors give themselves away in the same few places: a caption that strands one
+word on its own card, every syllable flashing in turn, music that is either a drone or a
+song with someone singing over your voice, a three-second hole where nothing is said, a
+cut that steps on the punchline, an ending that chops off the last word. This command was
+built by finding every one of those and taking it out.
+
+It was tuned in rounds. Each round, three real ads were cut, then four separate reviewers
+watched them, one each for captions, cutting, sound, plus a judge who scores "would anyone
+guess a tool edited this?" Every fault they found was fixed in the tool, not in the video,
+and the ads were cut again.
+
+| round | what was fixed | judge's scores (1-10, "looks human-edited") |
+|---|---|---|
+| 3 | captions by breath, music levels, hook, voice matching | 6 · 6 · 5 |
+| 4 | Thai line breaks, spelling, endings, intro-skipping music | 6 · 7 · 4 |
+| 5 | silent runs, dissolves, colour word, card timing | 6 · 7 · 6 |
+| 6 | Thai mark stacking, hidden camera cuts, missed speech, two unseen ads | 6 · 6 · 6 · 4 · 7 |
+
+The scores are honest, not flattering: the judge was told to find what still gives the
+edit away, and still does. The remaining tell is pacing in AI-generated source clips,
+which leave 1.5-3 s between lines; the tool now trims those runs to about 1.3 s.
+
+**What it does on every cut:**
+
+- **Captions** — one breath per card. Cards break at pauses and at cuts, never mid-word,
+  never ending on a word that leans into the next (Thai: ของ, ใน, ที่), never starting on a
+  closing particle (ครับ, นะ). Thai lines break between phrases, never inside ถูกกว่า or
+  กันน้ำรั่ว. **One** idea per card is coloured — a price with its unit, your brand name, or
+  the word the ad is about — not every word in turn. Speech-recognition misspellings are
+  corrected against a Thai dictionary (sound-alike consonants only, so names are left
+  alone). Cards sit above the TikTok/Reels buttons and the sign-off holds to the last frame.
+- **Cutting** — opens on a voice, not on wordless footage. Trims the air inside each take,
+  holds a beat after a punchline, keeps the busiest moment of each action shot and gives a
+  run of them about 1.8 s together. Long takes split at a real pause and reframe like a
+  second camera. One push-in at most per moment, aimed at your brand name or the key word.
+  Ends about a second after the last word, and never cuts into someone starting to speak.
+- **Music** — real instrumental tracks only, no singing (see below). Starts on a beat where
+  the track has properly arrived, skipping quiet intros. The level is **measured** against
+  the voice: about 12 LU under it in pauses, a smooth 4 dB dip under speech with no
+  pumping, lifted in long gaps, and up for the last beat before it fades.
+- **Sound** — voices matched across clips on the speech alone, whooshes felt rather than
+  heard and peaking on the cut, one flat final gain plus a limiter to -14 LUFS (no riding
+  leveller), 48 kHz.
+
+### The music library
+
+`music_generate` still exists, but nothing picks it automatically any more: a synthesised
+pad under an ad sounds like exactly what it is. Instead, build a library of real music
+once:
+
+```bash
+python build_music_library.py 100
+```
+
+It searches Jamendo through Openverse for tracks cleared for commercial use (CC0, CC-BY,
+CC-BY-SA), downloads them to `~/Downloads/music/beds`, and **listens to every one before
+keeping it**: Whisper checks for sung words, YAMNet checks for singing or speech, and tags
+like sad, dark or horror are skipped. Each kept track is catalogued with its mood (happy,
+energetic, chill, inspiring, warm), tempo and loudness. Credits for the CC-BY tracks are
+written to `ATTRIBUTION.txt` beside them — put the line in your post description.
+
+About 45 seconds per track. Run it once and leave it.
+
 
 ---
 
@@ -148,10 +227,9 @@ from a maths expression by FFmpeg on this PC.
 automatically on every shot change — the detector steps its sensitivity down until it finds
 transitions, because **a dissolve is invisible to hard-cut detection**.
 
-`music_generate` synthesises a bed: chord pad, sub bass, optional pulse, mixed at −20 LUFS
-so it sits under dialogue. Five moods (calm, uplifting, warm, tense, gentle). Verified in
-the spectrum — an "uplifting" bed's strongest partials land on 196/247/294 Hz (G3, B3, D4),
-real chord tones. It is deliberately simple background music, not a produced song.
+`music_generate` synthesises a bed: chord pad, sub bass, optional pulse. It is kept for
+when you ask for it by name, but nothing uses it automatically any more — see
+[the music library](#the-music-library).
 
 ## The one command
 
@@ -305,8 +383,9 @@ colour      28 ->  55      (washed out  -> normal)
 
 ### Thai subtitles
 
-Rendering is handled — the default font is **Tahoma**, which draws Thai vowels and tone
-marks correctly. `font: "Leelawadee UI"` also works.
+Rendering is handled — captions go through libass with **complex shaping**, which is what
+stacks a Thai tone mark above an upper vowel (ตั้ง, น้ำ). Without it every Thai caption
+draws the mark on top of the vowel, in any font. `font: "Leelawadee UI"` also works.
 
 Accuracy depends on the speech model you pick:
 

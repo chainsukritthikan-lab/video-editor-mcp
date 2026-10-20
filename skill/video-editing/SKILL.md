@@ -148,3 +148,21 @@ Straight cuts on every join are the giveaway of an unedited timeline.
   collapsed a whole cut before.
 - **Look at the frames.** Every caption bug in this project was found by
   grabbing frames and staring at them, never by a passing quality check.
+
+## Raw clips to a finished ad: `video_human_edit`
+
+Tuned over six review rounds (Oct 2026) until judges stopped finding the obvious
+auto-edit tells. Pass what you know:
+
+- `names` - the shop/brand and the product ("บุญชัยฮาร์ดแวร์", "พุก"). Kept whole on one
+  card and coloured; otherwise the colour falls on the stressed word, which is often weak.
+- `script` - the spoken lines from the shot prompts, when they exist. Whisper writes
+  "แต่ปู" for ตะปู: two real words, so no spell-check catches it. The script does.
+
+Music is picked from `~/Downloads/music/beds` (instrumental only, built by
+`build_music_library.py`) and levelled against the voice - do not pass `music_volume`
+unless the user asks for a specific level.
+
+Still judge the result with video-review agents: captions, cuts and sound separately,
+plus one judge asked "would anyone guess a tool edited this?". They find what a
+self-check cannot.

@@ -550,9 +550,13 @@ def t_mute(a):
 def t_add_music(a):
     src = check_input(a.get("path"), "video")
     music = check_input(a.get("music"), "music")
-    vol = float(a.get("volume", 0.3))
     keep = bool(a.get("keep_original_audio", True)) and has_audio(src)
     notes = ""
+    if a.get("volume") is not None:
+        vol = float(a["volume"])
+    else:
+        vol, why = _bed_gain(music, src if keep else None, ducked=False)
+        notes = " Level: %s." % why
     out = make_output(src, "music", a.get("output"), ".mp4")
     if keep:
         gain = "volume=%.3f" % vol
@@ -573,7 +577,7 @@ def t_add_music(a):
                 expr = "+".join(terms)
                 gain = ("volume='%.3f*(1+%.3f*max(0\\,min(1\\,%s)))':eval=frame"
                         % (vol, swell - 1.0, expr))
-                notes = " Music lifts in %d gap(s) between lines and settles under speech." % len(usable)
+                notes += " Music lifts in %d gap(s) between lines and settles under speech." % len(usable)
         # normalize=0 is essential: amix otherwise divides by the input count and
         # quietly drops the whole mix by ~6 dB.
         # Loop FIRST, then apply the envelope. Applying the gain before the loop makes
@@ -585,7 +589,7 @@ def t_add_music(a):
         fc = "[1:a]volume=%.3f,aloop=loop=-1:size=2e9,atrim=0:%.3f[a]" % (vol, duration_of(src))
     ffmpeg_run(["-i", src, "-i", music, "-filter_complex", fc,
                 "-map", "0:v", "-map", "[a]", "-c:v", "copy", "-shortest"] + AUDIO_ENC + [out])
-    return done(out, "Music added at volume %g%s.%s"
+    return done(out, "Music added at volume %.3g%s.%s"
                 % (vol, "" if keep else " (original audio replaced)", notes))
 
 
@@ -598,7 +602,8 @@ def t_subtitles(a):
     style = ("FontName=%s,FontSize=%d,PrimaryColour=&H00FFFFFF,"
              "OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,MarginV=40"
              % (font, size))
-    vf = "subtitles='%s':force_style='%s'" % (escape_filter_path(subs), style)
+    vf = srt_burn_arg(subs, style) if subs.lower().endswith(".srt") else \
+        "subtitles='%s':force_style='%s'" % (escape_filter_path(subs), style)
     out = make_output(src, "subs", a.get("output"), ".mp4")
     ffmpeg_run(["-i", src, "-vf", vf] + VIDEO_ENC + ["-c:a", "copy", out])
     return done(out, "Subtitles burned in permanently.")
@@ -1094,8 +1099,8 @@ _WHISPER_MODELS = {}
 def _load_whisper(size):
     try:
         from faster_whisper import WhisperModel
-    except ImportError:
-        raise ToolError("faster-whisper is not installed. Run:\n    pip install faster-whisper")
+    except ImportError as e:
+        raise ToolError("faster-whisper is not installed. Run:\n    pip install faster-whisper (" + str(e) + ")")
     if size not in _WHISPER_MODELS:
         try:
             _WHISPER_MODELS[size] = WhisperModel(size, device="cpu", compute_type="int8")
@@ -2250,8 +2255,11 @@ def t_add_music_auto(a):
     scored.sort(key=lambda x: x[0])
     gap, pick, info = scored[0]
 
-    vol = float(a.get("volume", 0.25))
     duck = bool(a.get("duck_under_speech", True)) and has_audio(src)
+    if a.get("volume") is not None:
+        vol = float(a["volume"])
+    else:
+        vol, _why = _bed_gain(pick, src if has_audio(src) else None, ducked=duck)
     dur = m["duration"]
     fade = float(a.get("fade", 1.5))
 
@@ -2562,9 +2570,73 @@ def subtitles_arg(name):
     An escaped colon on its own still ends the option, and quotes on their own do
     not protect the drive letter. This has now bitten in five separate filters.
     """
+    # shaping=complex is what makes Thai tone marks stack ABOVE an upper vowel
+    # (ตั้ง, น้ำ, รั่ว). The plain `subtitles` filter has no such option and
+    # renders with simple shaping, which draws the mark on top of the vowel - every
+    # Thai caption this tool made before 20 Oct 2026 had ตั้ง reading as ตั๊ง.
+    # The `ass` filter takes it; .srt files are converted to .ass first.
     if os.path.isdir(BUNDLED_FONTS):
-        return "subtitles=%s:fontsdir='%s'" % (name, escape_filter_path(BUNDLED_FONTS))
-    return "subtitles=%s" % name
+        return "ass=%s:fontsdir='%s':shaping=complex" % (name, escape_filter_path(BUNDLED_FONTS))
+    return "ass=%s:shaping=complex" % name
+
+
+def _srt_as_ass(srt, force_style=""):
+    """An .srt turned into an .ass that renders exactly as `subtitles=x.srt:
+    force_style=...` did - same 384x288 script space, same default style with the
+    overrides applied - so it can go through the `ass` filter and get complex
+    shaping. Line breaks inside a cue are kept."""
+    text = io.open(srt, encoding="utf-8-sig", errors="replace").read()
+    style = dict(Name="Default", Fontname="Arial", Fontsize="16",
+                 PrimaryColour="&Hffffff", SecondaryColour="&Hffffff",
+                 OutlineColour="&H0", BackColour="&H0", Bold="0", Italic="0",
+                 Underline="0", StrikeOut="0", ScaleX="100", ScaleY="100",
+                 Spacing="0", Angle="0", BorderStyle="1", Outline="1", Shadow="0",
+                 Alignment="2", MarginL="10", MarginR="10", MarginV="10", Encoding="0")
+    alias = {"FontName": "Fontname", "FontSize": "Fontsize"}
+    for kv in (force_style or "").split(","):
+        if "=" in kv:
+            k, v = kv.split("=", 1)
+            k = alias.get(k.strip(), k.strip())
+            if k in style:
+                style[k] = v.strip()
+    order = ["Name", "Fontname", "Fontsize", "PrimaryColour", "SecondaryColour",
+             "OutlineColour", "BackColour", "Bold", "Italic", "Underline", "StrikeOut",
+             "ScaleX", "ScaleY", "Spacing", "Angle", "BorderStyle", "Outline", "Shadow",
+             "Alignment", "MarginL", "MarginR", "MarginV", "Encoding"]
+
+    def t_ass(t):
+        h, m, rest = t.strip().replace(".", ",").split(":")
+        sec, ms = rest.split(",")
+        return "%d:%02d:%02d.%02d" % (int(h), int(m), int(sec), int(ms) // 10)
+
+    events = []
+    for block in re.split(r"\n\s*\n", text.strip()):
+        lines = [l for l in block.splitlines() if l.strip()]
+        tm = next((l for l in lines if "-->" in l), None)
+        if not tm:
+            continue
+        a_, b_ = [x.strip().split(" ")[0] for x in tm.split("-->")]
+        body = "\\N".join(re.sub(r"<[^>]+>", "", l) for l in lines[lines.index(tm) + 1:])
+        events.append("Dialogue: 0,%s,%s,Default,,0,0,0,,%s" % (t_ass(a_), t_ass(b_), body))
+    out = os.path.join(_tmpdir(), "srt2ass_%d_%d.ass" % (os.getpid(), len(events)))
+    with io.open(out, "w", encoding="utf-8-sig") as fh:
+        fh.write("\n".join([
+            "[Script Info]", "ScriptType: v4.00+", "PlayResX: 384", "PlayResY: 288",
+            "ScaledBorderAndShadow: yes", "", "[V4+ Styles]",
+            "Format: " + ", ".join(order),
+            "Style: " + ",".join(style[k] for k in order), "", "[Events]",
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"]
+            + events) + "\n")
+    return out
+
+
+def srt_burn_arg(srt, force_style=""):
+    """The filter for burning an .srt with a style - via .ass, for Thai shaping."""
+    ass = _srt_as_ass(srt, force_style)
+    if os.path.isdir(BUNDLED_FONTS):
+        return "ass='%s':fontsdir='%s':shaping=complex" % (
+            escape_filter_path(ass), escape_filter_path(BUNDLED_FONTS))
+    return "ass='%s':shaping=complex" % escape_filter_path(ass)
 
 
 _FONT_FILE_CACHE = {}
@@ -2719,7 +2791,8 @@ def t_burn_subtitles(a):
                           _hex_to_ass(a.get("text_color")),
                           _hex_to_ass(a.get("box_color"), a.get("box_opacity", 160)),
                           a.get("bold"), a.get("margin"))
-    vf = "subtitles='%s':force_style='%s'" % (escape_filter_path(use), style)
+    vf = srt_burn_arg(use, style) if use.lower().endswith(".srt") else \
+        "subtitles='%s':force_style='%s'" % (escape_filter_path(use), style)
     out = make_output(src, "subs", a.get("output"), ".mp4")
     ffmpeg_run(["-i", src, "-vf", vf] + VIDEO_ENC + ["-c:a", "copy", out])
     return done(out, "Burned %d caption(s) in '%s' style, re-wrapped to %d chars per line."
@@ -2752,25 +2825,114 @@ def _asr_frags(src, lang, size):
     import contextlib
 
     def transcribe():
+        # Two passes. The VAD pass is the trusted one - but Silero VAD threw away
+        # two of three spoken lines in an ad with music and a hammer under the voice
+        # ("ผนังปูนต้องใช้พุก", "บุญชัยฮาร์ดแวร์" - Boonchai พุก ad, 20 Oct), and
+        # an edit built on that transcript CUTS speech it never heard. So wherever
+        # there is sustained sound the VAD pass has no words for, Whisper listens
+        # again without VAD, in the language the first pass found, and only words
+        # inside those gaps are taken. Running without VAD everywhere was tried and
+        # is worse: over music it invents whole lines in another language ("Hãy
+        # subscribe cho kênh La La School").
         model = _load_whisper(size)
         with contextlib.redirect_stdout(sys.stderr):
             segs, info = model.transcribe(src, language=None if lang == "auto" else lang,
                                           vad_filter=True, beam_size=5, word_timestamps=True)
             segs = list(segs)
-        frags = []
-        for seg in segs:
-            for w in (getattr(seg, "words", None) or []):
-                txt = w.word or ""
-                if not txt:
-                    continue
-                if frags and txt[0] in THAI_COMBINING:
-                    frags[-1] = [frags[-1][0], w.end, frags[-1][2] + txt]
-                else:
-                    frags.append([w.start, w.end, txt])
-        return {"frags": frags, "lang": getattr(info, "language", lang)}
+        det = getattr(info, "language", None) or (None if lang == "auto" else lang)
+        words = [(w.start, w.end, w.word or "") for seg in segs
+                 for w in (getattr(seg, "words", None) or []) if (w.word or "")]
 
-    got = cached("asr", src, {"lang": lang, "size": size}, transcribe)
+        gaps = []
+        try:
+            env = _env100(src)
+        except Exception:
+            env = None
+        if env is not None and det:
+            db, thr = env
+            k, n = 0, len(db)
+            while k < n:
+                if db[k] > thr:
+                    j = k
+                    while j < n and (db[j] > thr or (j + 8 < n and max(db[j:j + 8]) > thr)):
+                        j += 1
+                    a_, b_ = k / 100.0, j / 100.0
+                    covered = any(ws - 0.25 < b_ and we + 0.25 > a_ for ws, we, _ in words)
+                    if b_ - a_ >= 0.4 and not covered:
+                        gaps.append((a_, b_))
+                    k = j
+                else:
+                    k += 1
+        if gaps:
+            ghost = re.compile(r"(subscribe|thank you|thanks for watching|subtitles? by|"
+                               r"ขอบคุณ(ที่|สำหรับการ)รับชม|ติดตามช่อง|กดไลค์|กดติดตาม|"
+                               r"ซับไทย|amara|kênh)", re.I)
+            with contextlib.redirect_stdout(sys.stderr):
+                segs2, _i2 = model.transcribe(src, language=det, vad_filter=False,
+                                              beam_size=5, word_timestamps=True,
+                                              condition_on_previous_text=False)
+                segs2 = list(segs2)
+            for seg in segs2:
+                if seg.no_speech_prob > 0.6 or seg.avg_logprob < -1.0:
+                    continue
+                if ghost.search(seg.text or ""):
+                    continue
+                sw = [w for w in (getattr(seg, "words", None) or []) if (w.word or "")]
+                if not sw:
+                    continue
+                inside = sum(max(0.0, min(w.end, gb) - max(w.start, ga))
+                             for w in sw for ga, gb in gaps)
+                span = sum(w.end - w.start for w in sw) or 1.0
+                if inside / span < 0.5:
+                    continue
+                s0, s1 = sw[0].start, sw[-1].end
+                # this line replaces whatever the first pass had over the same time
+                words = [x for x in words if x[1] <= s0 or x[0] >= s1]
+                words += [(w.start, w.end, w.word) for w in sw]
+        words.sort(key=lambda x: x[0])
+
+        frags = []
+        for ws, we, txt in words:
+            if frags and txt[0] in THAI_COMBINING:
+                frags[-1] = [frags[-1][0], we, frags[-1][2] + txt]
+            else:
+                frags.append([ws, we, txt])
+        return {"frags": frags, "lang": det or lang}
+
+    got = cached("asr4", src, {"lang": lang, "size": size}, transcribe)
     return ([(f[0], f[1], f[2]) for f in got["frags"]], got.get("lang") or lang)
+
+
+def _th_fix_text(full):
+    """Fix recogniser misspellings in a whole Thai line. Swaps are one consonant
+    for a sound-alike, so the text keeps its length and the character-to-time map
+    stays valid."""
+    if not re.search(r"[\u0e01-\u0e2e]", full or ""):
+        return full
+    try:
+        from pythainlp.tokenize import word_tokenize
+        toks = word_tokenize(full, engine="newmm")
+    except Exception:
+        return full
+    out, i = [], 0
+    while i < len(toks):
+        done_ = False
+        for n in (3, 2):
+            chunk = "".join(toks[i:i + n])
+            if len(toks[i:i + n]) == n and chunk.strip() == chunk and len(chunk) >= 2:
+                fixed = _th_spellfix(chunk)
+                if fixed != chunk and len(fixed) == len(chunk):
+                    out.append(fixed)
+                    i += n
+                    done_ = True
+                    break
+        if not done_:
+            t = toks[i]
+            f = _th_spellfix(t) if len(t) >= 2 else t
+            out.append(f if len(f) == len(t) else t)
+            i += 1
+    fixed_full = "".join(out)
+    return fixed_full if len(fixed_full) == len(full) else full
 
 
 def _word_timings(src, lang, size, want_map=False):
@@ -2790,6 +2952,7 @@ def _word_timings(src, lang, size, want_map=False):
     for s, e, txt in frags:
         spans.append((pos, pos + len(txt), s, e))
         pos += len(txt)
+    full = _th_fix_text(full)
 
     def time_at(idx, end=False):
         for lo, hi, s, e in spans:
@@ -3149,7 +3312,8 @@ def _cues_from_text(given, total, timer=None):
                 line.append({"t": word, "s": round(a_t, 3), "e": round(max(b_t, a_t + 0.05), 3)})
                 k += 1
             lines.append(line)
-        payload.append({"s": float(s), "e": float(e), "lines": lines})
+        payload.append({"s": float(s), "e": float(e), "lines": lines,
+                        "key": cue.get("key"), "lock": bool(cue.get("lock"))})
 
     # Hold each cue on screen a moment past the last word so it can be read - but never
     # into the next one. The component takes the FIRST cue whose window contains the
@@ -3157,7 +3321,7 @@ def _cues_from_text(given, total, timer=None):
     hold = 0.3
     for i, cue in enumerate(payload):
         limit = payload[i + 1]["s"] if i + 1 < len(payload) else total
-        cue["e"] = min(cue["e"] + hold, limit, total)
+        cue["e"] = min(cue["e"] + (0 if cue.get("lock") else hold), limit, total)
     return payload
 
 
@@ -3211,11 +3375,40 @@ def _render_kinetic_ass(a, src, payload, w, h, total, font, out, text_only=False
     glow = float(a.get("glow", 1.0))
 
     events = []
+    if (a.get("highlight") or "word") in ("key", "none"):
+        # Whole card at once, cut in hard with a 3-frame settle; white text with
+        # the one word the speaker leans on in the accent colour.
+        for cue in payload:
+            keys = [] if a.get("highlight") == "none" else (cue.get("key") or [])
+            if isinstance(keys, str):
+                keys = [keys]
+            keys = [k.strip() for k in keys if k and k.strip()]
+            parts = []
+            for li, ln in enumerate(cue["lines"]):
+                if li:
+                    parts.append("\\N")
+                for wd in ln:
+                    t_ = wd["t"]
+                    b = t_.strip()
+                    lit = b and any(b == k or (len(b) >= 2 and b in k and len(k) > 3) or
+                                    (len(k) >= 2 and k in b) for k in keys)
+                    parts.append("{\\c%s}%s{\\c%s}" % (accent, t_, primary) if lit else t_)
+            events.append("Dialogue: 1,%s,%s,K,,0,0,0,,{\\fscx114\\fscy114"
+                          "\\t(0,130,0.6,\\fscx100\\fscy100)}%s"
+                          % (ts(cue["s"]), ts(cue["e"]), "".join(parts)))
+        payload = []
     for cue in payload:
         flat = [wd for ln in cue["lines"] for wd in ln]
+        # Word onsets come from the recogniser: they can sit outside the cue window and
+        # they are not always in order. Two segments of the same cue that overlap in time
+        # make libass stack the second copy ABOVE the first (Boonchai 16 Sep: the whole
+        # caption drawn twice), so the onsets are clamped into the cue and made monotonic.
+        starts = [cue["s"]]
+        for wd in flat[1:]:
+            starts.append(min(cue["e"], max(starts[-1], max(cue["s"], float(wd["s"])))))
         for i, live in enumerate(flat):
-            start = live["s"] if i else cue["s"]
-            end = flat[i + 1]["s"] if i + 1 < len(flat) else cue["e"]
+            start = starts[i]
+            end = starts[i + 1] if i + 1 < len(flat) else cue["e"]
             if end <= start:
                 continue
 
@@ -3997,10 +4190,8 @@ def t_auto_edit(a):
         # video_auto_subtitles already wrapped these on syllable boundaries; re-wrapping
         # by character count here would split Thai words back apart.
         wrapped = srt
-        chain.append("subtitles='%s':force_style='%s'"
-                     % (escape_filter_path(wrapped),
-                        _style_string(a.get("subtitle_style") or "premium",
-                                      font=a.get("font"))))
+        chain.append(srt_burn_arg(wrapped, _style_string(
+            a.get("subtitle_style") or "premium", font=a.get("font"))))
     fi, fo = float(a.get("fade_in", 0.5)), float(a.get("fade_out", 0.6))
     for c in ([("fade=t=in:st=0:d=%.2f" % fi) if fi > 0 else None,
                ("fade=t=out:st=%.2f:d=%.2f" % (dur - fo, fo)) if (fo > 0 and dur > fo) else None]):
@@ -4099,19 +4290,17 @@ def t_auto_edit(a):
 
         if mood:
             try:
-                bed = os.path.join(tmp, "ae_bed_%d.mp3" % os.getpid())
-                t_music_generate({"mood": mood, "duration": duration_of(path) + 0.5,
-                                  "output": bed})
+                bed, bed_note = _pick_bed(mood, duration_of(path))
+                if not bed:
+                    raise ToolError(bed_note)
                 staged = os.path.join(tmp, "ae_mus_%d.mp4" % os.getpid())
-                t_add_music({"path": path, "music": bed,
-                             "volume": float(a.get("music_level", 0.22)),
-                             "keep_original_audio": True, "output": staged})
+                margs = {"path": path, "music": bed, "keep_original_audio": True,
+                         "output": staged}
+                if a.get("music_level") is not None:
+                    margs["volume"] = float(a["music_level"])
+                t_add_music(margs)
                 shutil.move(staged, path)
-                try:
-                    os.remove(bed)
-                except OSError:
-                    pass
-                steps.append("'%s' music bed underneath" % mood)
+                steps.append("music: %s" % bed_note)
             except ToolError as e:
                 steps.append("music skipped: %s" % str(e).splitlines()[0])
 
@@ -6843,10 +7032,18 @@ def t_montage(a):
     if music:
         music = check_input(music, "music")
     elif a.get("music_mood", "warm"):
-        music = os.path.join(tmp, "mg_bed_%d.wav" % tag)
-        t_music_generate({"mood": a.get("music_mood") or "warm",
-                          "duration": total + 2.0, "bpm": a.get("music_bpm") or 92,
-                          "pulse_level": 0.35, "output": music})
+        pick, _pn = _pick_bed(a.get("music_mood") or "warm", total + 2.0)
+        if pick:
+            music = os.path.join(tmp, "mg_bed_%d.wav" % tag)
+            ml = _loudness(pick)
+            g = 10 ** ((-20.0 - ml) / 20.0) if ml and ml > -60 else 0.3
+            subprocess.run([FFMPEG, "-y", "-v", "error", "-i", os.path.abspath(pick),
+                            "-t", "%.2f" % (total + 2.0), "-af",
+                            "volume=%.4f,afade=t=in:st=0:d=0.8" % g,
+                            "-ac", "2", "-ar", "48000", music], check=True,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        else:
+            music = None
     if music and sound_at:
         # One expression rather than a chain of volume filters, so the ramps cross
         # cleanly instead of multiplying together at the joins.
@@ -8025,8 +8222,12 @@ def t_build(a):
         else:
             acur = "[a0]"
             for i in range(1, len(srcs)):
+                # A hard cut takes ONE frame off the picture, so the sound must lose the same
+                # single frame - a full-length crossfade here put the voice ~0.08 s ahead of
+                # the mouth at every cut (Boonchai 16 Sep: four cuts, lips a third late).
+                a_d = (1.0 / fps) if trans_list[i - 1] == "cut" else a_cross
                 aparts.append("%s[a%d]acrossfade=d=%.3f:c1=qsin:c2=qsin[ax%d]"
-                             % (acur, i, a_cross, i))
+                             % (acur, i, a_d, i))
                 acur = "[ax%d]" % i
             aparts.append("%sanull[abase]" % acur)
         acur = "[abase]"
@@ -8069,8 +8270,63 @@ def t_build(a):
             mp = check_input(music, "music")
             extra_inputs.append(mp)
             idx = n_in + len(extra_inputs) - 1
-            aparts.append("[%d:a]aloop=loop=-1:size=2e9,volume=%.3f[bed]"
-                         % (idx, float(a.get("music_volume", 0.22))))
+            # Fade the bed in and out, and duck it under the voice: a bed at one
+            # flat level fights every word, which is most of why a cut "sounds off".
+            m_tail = max(0.0, total - 1.0)
+            if a.get("music_volume") is not None:
+                m_gain = float(a["music_volume"])
+            else:
+                vl = [v for v in (_loudness(p) for p in srcs if has_audio(p))
+                      if v is not None and v > -45]
+                m_gain, _why = _bed_gain(mp, ducked=bool(a.get("duck", True)),
+                                         voice_lufs=(max(vl) if vl else None))
+            m_start = float(a["music_start"]) if a.get("music_start") is not None \
+                else _bed_start(mp)
+            aparts.append("[%d:a]atrim=start=%.3f,asetpts=N/SR/TB,"
+                          "aloop=loop=-1:size=2e9,atrim=0:%.3f,asetpts=N/SR/TB,"
+                          "aresample=48000,volume=%.4f,afade=t=in:st=0:d=0.4,"
+                          "afade=t=out:st=%.3f:d=1.0[bed0]"
+                         % (idx, m_start, total, m_gain, m_tail))
+            spans = sorted(a.get("speech_spans") or [])
+            if spans and a.get("duck", True):
+                # Merge lines closer than 0.7s: dipping back up in every breath is
+                # what made the bed "breathe". Then one smooth expression: down 5 dB
+                # under the voice, back up between sentences, up again after the
+                # last word so the music finishes the film.
+                merged = []
+                for s0, e0 in spans:
+                    if merged and s0 - merged[-1][1] < 0.7:
+                        merged[-1][1] = max(merged[-1][1], e0)
+                    else:
+                        merged.append([s0, e0])
+                dip = 10 ** (-4.0 / 20)
+                terms = []
+                for s0, e0 in merged[:60]:
+                    terms.append("min(1\\,max(0\\,min((t-%.3f)/0.15\\,(%.3f-t)/0.45)))"
+                                 % (s0 - 0.15, e0 + 0.45))
+                expr = "1-%.4f*min(1\\,%s)" % (1 - dip, "+".join(terms))
+                # Where nobody talks for a while the music carries the film: +4 dB
+                # in any gap longer than 1.4s, eased in and out.
+                lifts = []
+                for (s0, e0), (s1, e1) in zip(merged, merged[1:]):
+                    if s1 - e0 > 1.4:
+                        lifts.append("min(1\\,max(0\\,min((t-%.3f)/0.4\\,(%.3f-t)/0.3)))"
+                                     % (e0 + 0.45, s1 - 0.15))
+                if lifts:
+                    expr = "(%s)*(1+0.58*min(1\\,%s))" % (expr, "+".join(lifts))
+                # a human brings the music up for the last beat: +3 dB over 0.5 s,
+                # starting once the last line has finished ducking back
+                rise_at = merged[-1][1] + 0.45
+                if total - rise_at > 0.4:
+                    expr = "(%s)*(1+0.41*min(1\\,max(0\\,(t-%.3f)/0.5)))" % (expr, rise_at)
+                aparts.append("[bed0]volume='%s':eval=frame[bed]" % expr)
+            elif a.get("duck", True):
+                aparts.append("%sasplit=2[adlg][akey]" % acur)
+                aparts.append("[bed0][akey]sidechaincompress=threshold=0.02:ratio=6:"
+                              "attack=15:release=400:makeup=1[bed]")
+                acur = "[adlg]"
+            else:
+                aparts.append("[bed0]anull[bed]")
             aparts.append("%s[bed]amix=inputs=2:duration=first:normalize=0[awm]" % acur)
             acur = "[awm]"
 
@@ -8160,7 +8416,7 @@ def t_build(a):
     # between samples - so a source that is already squared off at full scale can
     # still put samples on the rail afterwards. A hard ceiling behind it costs
     # nothing and makes the promise in `true_peak` actually hold.
-    ceiling = "alimiter=limit=%.4f:attack=5:release=60:level=disabled" \
+    ceiling = "alimiter=limit=%.4f:attack=1:release=50:level=disabled" \
               % min(0.999, 10.0 ** (peak / 20.0))
     note = ""
     if has_snd:
@@ -8184,18 +8440,34 @@ def t_build(a):
             linear = float(vals["input_tp"]) + gain <= peak + 0.1
             # target_offset is not optional: leaving it out landed a finished ad
             # at -15.06 LUFS against a -14.0 target, measured.
-            final = ("%sloudnorm=I=%.1f:TP=%.1f:measured_I=%s:measured_TP=%s:"
-                     "measured_LRA=%s:measured_thresh=%s:offset=%s%s[aout]"
-                     % (acur, target, peak, vals["input_i"], vals["input_tp"],
-                        vals["input_lra"], vals["input_thresh"],
-                        vals.get("target_offset", "0.0"),
-                        ":linear=true" if linear else ""))
-            final = final.replace("[aout]", "," + ceiling + "[aout]")
+            # ONE flat gain, then a limiter for the few peaks it pushes over. The
+            # dynamic leveller used before rode the gain inside sentences: pauses and
+            # room hiss came up 8 dB while the words came up 3, and the bed wobbled
+            # under the voice (measured, Boonchai clapback 20 Oct). Loudnorm also
+            # left the file at 96 kHz.
+            tail_fade = "afade=t=out:st=%.3f:d=0.12," % max(0.0, total - 0.12)
+            final = ("%svolume=%.2fdB,%s%s,aresample=48000[aout]"
+                     % (acur, gain, tail_fade, ceiling))
+            if True:
+                # The limiter shaves what the flat gain pushed over the ceiling, and
+                # that costs loudness (a clapback cut landed at -15.5); even without
+                # it the files landed 0.4-0.9 dB short. Measure the limited result
+                # once and make up the difference.
+                m2 = run("%svolume=%.2fdB,%s,loudnorm=I=%.1f:TP=%.1f:print_format=json[aout]"
+                         % (acur, gain, ceiling, target, peak), None, measure_only=True)
+                try:
+                    b2 = m2.stderr[m2.stderr.rindex("{"):]
+                    got = float(json.loads(b2[:b2.index("}") + 1])["input_i"])
+                    gain += max(-3.0, min(1.5, target - got))
+                    final = ("%svolume=%.2fdB,%s%s,aresample=48000[aout]"
+                             % (acur, gain, tail_fade, ceiling))
+                except (ValueError, KeyError):
+                    pass
             note = "\n  Loudness measured then corrected in one go (%s -> %.1f LUFS)." \
                    % (vals["input_i"], target)
             if not linear:
-                note += ("\n  A flat %+.1f dB lift would have peaked at %.1f dBTP, so the "
-                         "levelling rides the loud moments instead."
+                note += ("\n  A flat %+.1f dB lift would have peaked at %.1f dBTP; the "
+                         "limiter takes those peaks, the rest is untouched."
                          % (gain, float(vals["input_tp"]) + gain))
         else:
             final = "%sloudnorm=I=%.1f:TP=%.1f,%s[aout]" % (acur, target, peak, ceiling)
@@ -8897,7 +9169,1709 @@ def t_voice_over(a):
                 % (lang, voice, spoken, at, note))
 
 
+PLATFORM_LENGTH = {
+    "tiktok": 24.0, "reels": 24.0, "shorts": 28.0,
+    "facebook": 30.0, "line": 20.0, "youtube": None, "none": None,
+}
+
+
+def _director_read(src):
+    """Everything about one source clip the decisions below are made from."""
+    import numpy as np
+    info = {"path": src, "duration": duration_of(src), "audio": has_audio(src)}
+    try:
+        info["colour"] = _colour_of(src)          # (luma, blue axis, red axis)
+    except Exception:
+        info["colour"] = (128.0, 128.0, 128.0)
+    # How much the picture moves: sample pairs of frames across the clip and average
+    # the change. A talking head sits near 0.05; a hand-held walk-and-talk near 0.4.
+    moves = []
+    d = info["duration"]
+    for frac in (0.15, 0.35, 0.55, 0.75):
+        try:
+            a_ = _frame_gray(src, d * frac, width=64)
+            b_ = _frame_gray(src, min(d - 0.05, d * frac + 0.4), width=64)
+            if a_ is None or b_ is None or a_.shape != b_.shape:
+                continue
+            moves.append(float(np.abs(a_.astype("float32")
+                                      - b_.astype("float32")).mean()) / 255.0)
+        except Exception:
+            continue
+    info["motion"] = float(min(1.0, (sum(moves) / len(moves) * 6.0) if moves else 0.0))
+    # How much of the clip is silence - the difference between a piece carried by a
+    # voice and one carried by pictures, which decides captions and music level.
+    if info["audio"]:
+        try:
+            quiet = sum(e - s for s, e in merge_spans(detect_silence(src, -34, 0.45)))
+            info["talky"] = float(max(0.0, 1.0 - quiet / max(0.5, d)))
+        except Exception:
+            info["talky"] = 0.5
+    else:
+        info["talky"] = 0.0
+    return info
+
+
+def _director_language(srcs, model="base"):
+    """Which language is spoken, by looking at the letters that come back.
+
+    Guessing from the filename or asking the user was the wrong place for this: the
+    footage says it plainly, and Thai script is unmistakable in a transcript.
+    """
+    thai = latin = 0
+    for src in srcs[:2]:                     # two clips is enough to tell
+        if not has_audio(src):
+            continue
+        try:
+            words = _word_timings(src, "auto", model)[0]
+        except Exception:
+            continue
+        for w in words:
+            for ch in w.get("t", ""):
+                if "฀" <= ch <= "๿":
+                    thai += 1
+                elif ch.isalpha():
+                    latin += 1
+    if thai + latin < 8:
+        return None                          # nothing said worth captioning
+    return "th" if thai > latin else "en"
+
+
+def t_director(a):
+    """Watch the footage, decide the whole edit, then cut it - no settings required."""
+    paths = a.get("paths") or []
+    if not paths:
+        raise ToolError("Give one or more clips in 'paths'.")
+    srcs = [check_input(p, "video") for p in paths]
+
+    reads = [_director_read(s) for s in srcs]
+    total_raw = sum(r["duration"] for r in reads)
+    motion = sum(r["motion"] for r in reads) / len(reads)
+    talky = sum(r["talky"] for r in reads) / len(reads)
+    luma = sum(r["colour"][0] for r in reads) / len(reads)
+    chroma = sum(abs(r["colour"][1] - 128.0) + abs(r["colour"][2] - 128.0)
+                 for r in reads) / len(reads)
+    any_audio = any(r["audio"] for r in reads)
+
+    why = []                                  # every decision, and what decided it
+
+    # --- how long ------------------------------------------------------------
+    platform = (a.get("platform") or "tiktok").strip().lower()
+    if platform not in PLATFORM_LENGTH:
+        raise ToolError("platform must be one of: %s" % ", ".join(sorted(PLATFORM_LENGTH)))
+    target = a.get("target_duration")
+    if target is not None:
+        target = float(target)
+        why.append("length: %.0fs because you asked for it" % target)
+    else:
+        target = PLATFORM_LENGTH[platform]
+        if target is None:
+            why.append("length: left alone - %s does not punish a long cut" % platform)
+        else:
+            # Never stretch: if there is less footage than the platform ideal, the
+            # cut is as long as the footage and padding it would only add dead air.
+            target = min(target, total_raw * 0.85)
+            why.append("length: %.0fs - %s holds attention about that long, and there "
+                       "is %.0fs of raw footage to choose from" % (target, platform, total_raw))
+
+    # --- the grade -----------------------------------------------------------
+    # Dark or flat footage wants contrast; footage that is already colourful wants
+    # leaving mostly alone, or the skin goes orange.
+    if luma < 95:
+        style = "cinematic"
+        why.append("grade: cinematic - the footage measures dark (luma %.0f), so it wants "
+                   "lifted shadows and contrast" % luma)
+    elif chroma > 26:
+        style = "clean"
+        why.append("grade: clean - colour is already strong (chroma %.0f); pushing it "
+                   "further would turn skin orange" % chroma)
+    elif motion > 0.35 and luma > 118:
+        # Only bright footage survives a contrast push. Choosing punchy on merely
+        # average-lit footage crushed 17% of the picture into black on the first
+        # clip this was tried on - the movement said energetic, the exposure could
+        # not pay for it.
+        style = "punchy"
+        why.append("grade: punchy - lots of movement (%.2f) and enough light (luma %.0f) "
+                   "to take the contrast" % (motion, luma))
+    else:
+        style = "warm"
+        why.append("grade: warm - calm, evenly-lit footage (luma %.0f, movement %.2f) "
+                   "flatters a warm look" % (luma, motion))
+
+    # --- captions ------------------------------------------------------------
+    subs = None
+    if any_audio and talky > 0.25:
+        subs = _director_language(srcs, a.get("subtitle_model") or "base")
+        if subs:
+            why.append("captions: %s - people are speaking through %.0f%% of the footage, "
+                       "and most viewers watch on mute" % (subs, talky * 100))
+    if not subs:
+        why.append("captions: none - there is no sustained speech to caption")
+
+    # --- music ---------------------------------------------------------------
+    if motion > 0.4:
+        mood = "uplifting"
+    elif motion > 0.2:
+        mood = "warm"
+    elif talky > 0.5:
+        mood = "gentle"
+    else:
+        mood = "calm"
+    # Level is measured, not guessed: the bed is set against the voice's own
+    # loudness when the music goes on (see _bed_gain).
+    music_level = a.get("music_level")
+    why.append("music: a real instrumental %s track - movement %.2f, speech %.0f%% of "
+               "the runtime; level set against the voice so it stays background"
+               % (mood, motion, talky * 100))
+
+    # --- the joins -----------------------------------------------------------
+    # Fast footage should hard-cut. Dissolving a busy shot into another busy shot
+    # turns both to mush, and it is the single thing that reads as amateur.
+    if motion > 0.3 or (target and target <= 25):
+        trans, tdur = "fade", 0.22
+        why.append("joins: hard cuts inside a scene, a fast 0.22s dissolve between scenes - "
+                   "a short, moving piece cannot afford a slow blend")
+    else:
+        trans, tdur = "fade", 0.5
+        why.append("joins: hard cuts inside a scene, a 0.50s dissolve between scenes - "
+                   "the footage is calm enough to breathe")
+
+    # --- sound effects -------------------------------------------------------
+    if talky > 0.55:
+        sfx = False
+        why.append("transition sounds: off - the piece is mostly dialogue and a whoosh "
+                   "over a line is a distraction")
+    else:
+        sfx = "transition"
+        why.append("transition sounds: on - little dialogue, so a whoosh into each cut "
+                   "and an impact on it gives the edit its rhythm")
+
+    plan = ("The director watched %d clip(s), %.0fs of footage.\n\n%s\n"
+            % (len(srcs), total_raw, "\n".join("  - " + w for w in why)))
+
+    if a.get("plan_only"):
+        return (plan + "\nNothing was rendered. Run again without 'plan_only' to cut it, "
+                       "or override any single decision by passing it (style, subtitles, "
+                       "music, target_duration, transition_duration, sfx).")
+
+    edit = {
+        "paths": paths,
+        "style": a.get("style") or style,
+        "subtitles": a.get("subtitles") or subs,
+        "subtitle_style": a.get("subtitle_style") or "premium",
+        "subtitle_model": a.get("subtitle_model") or "large-v3",
+        "music": a.get("music") or mood,
+        "music_level": music_level,
+        "sfx": sfx if a.get("sfx") is None else a.get("sfx"),
+        "transition": trans,
+        "transition_duration": float(a.get("transition_duration") or tdur),
+        "pacing": "editorial",
+        "target_duration": target,
+        "protect_shots": a.get("protect_shots"),
+        "respect_speech": True,
+        "drop_repeats": True,
+        "match_colour": True,
+        "cut_on_action": True,
+        "accelerate": True,
+        "aspect": a.get("aspect"),
+        "end_title": a.get("end_title"),
+        "end_subtitle": a.get("end_subtitle"),
+        "proof": a.get("proof"),
+        "output": a.get("output"),
+    }
+    edit = {k: v for k, v in edit.items() if v is not None}
+    result = t_auto_edit(edit)
+
+    # The edit is not finished until something has looked at it. Reporting a render
+    # that has black bars or a crushed grade as "done" is how a bad cut gets posted.
+    text = result if isinstance(result, str) else None
+    parts = [plan, "-" * 60, text or "Rendered."]
+    if text:
+        out = None
+        for line in text.splitlines():
+            if "->" in line and os.path.splitext(line.strip().split("-> ")[-1])[1]:
+                out = line.strip().split("-> ")[-1].strip()
+        if out and os.path.isfile(out):
+            try:
+                qc = t_check({"path": out})
+            except Exception as e:
+                qc = None
+                parts.append("Quality check skipped: %s" % e)
+            if qc:
+                parts += ["-" * 60, "Quality check:", qc]
+                # A director that reports its own render is faulty and stops there has
+                # not finished the job. The grade is the one thing here that causes
+                # crushed shadows or blown highlights, and it is ours to take back.
+                SOFTER = {"punchy": "clean", "cinematic": "clean",
+                          "warm": "clean", "clean": "none"}
+                hurt = ("Crushed shadows" in qc) or ("Blown highlights" in qc)
+                if (hurt and not a.get("style") and not a.get("_regraded")
+                        and edit["style"] in SOFTER):
+                    softer = SOFTER[edit["style"]]
+                    parts += ["-" * 60,
+                              "The grade caused that, so it has been taken back: "
+                              "'%s' -> '%s', re-cutting once."
+                              % (edit["style"], softer)]
+                    retry = dict(a)
+                    retry["style"] = softer
+                    retry["_regraded"] = True
+                    try:
+                        return "\n".join(str(p) for p in parts) + "\n\n" + str(t_director(retry))
+                    except ToolError as e:
+                        parts.append("Re-cut failed, keeping the first render: %s" % e)
+    return "\n".join(str(p) for p in parts)
+
+
+# ---------------------------------------------------------------- human edit
+# Words an editor cuts without being asked. Kept short on purpose: "เออ" is also a
+# casual "yes" and "so"/"like" carry meaning often enough that cutting them blind
+# would take real words out of people's mouths.
+FILLER_WORDS = {"um", "umm", "uh", "uhh", "uhm", "erm", "hmm", "mm",
+                "เอ่อ", "อ่า", "อืม", "เอ้อ"}
+
+# How a cut breathes at each energy. gap = longest pause left inside a take;
+# static = longest the picture may sit still; alt = the "second camera" framing a
+# jump cut alternates to; punch = extra push on a stressed word; sfx = how much
+# sound design (0 none, 1 restrained, 2 loud).
+HUMAN_PACE = {
+    "calm":   {"gap": 0.30, "pad": 0.14, "static": 4.0, "alt": 1.08, "punch": 0.08, "sfx": 0},
+    "normal": {"gap": 0.20, "pad": 0.10, "static": 3.0, "alt": 1.12, "punch": 0.12, "sfx": 1},
+    "hype":   {"gap": 0.12, "pad": 0.07, "static": 2.0, "alt": 1.18, "punch": 0.16, "sfx": 2},
+}
+HUMAN_BPM = {"calm": 85, "normal": 105, "hype": 125}
+# A music bed under a talking ad must never be any of these.
+_MOOD_WRONG = ("scary", "creepy", "horror", "halloween", "dissonant", "melancholy",
+               "suspense", "sad", "silence")
+
+
+def _env100(src):
+    """Loudness in dB every 10 ms, plus the room's floor and the voice's level."""
+    import numpy as np
+    pcm, rate = _decode_pcm(src, 16000, max_seconds=600)
+    hop = rate // 100
+    n = len(pcm) // hop
+    if n < 10:
+        return None
+    fr = pcm[:n * hop].reshape(n, hop)
+    db = 20 * np.log10(np.sqrt((fr ** 2).mean(axis=1)) + 1e-6)
+    floor, voice = float(np.percentile(db, 10)), float(np.percentile(db, 90))
+    return db, floor + 0.3 * (voice - floor)
+
+
+def _quiet_after(env, t, look=0.35):
+    """First moment after t the voice has actually stopped - whisper's word ends run
+    early often enough that cutting on them clips the last syllable."""
+    if env is None:
+        return None
+    db, thr = env
+    i0, i1 = int(t * 100), min(len(db) - 3, int((t + look) * 100))
+    for i in range(max(0, i0), i1):
+        if db[i] < thr and db[i + 1] < thr and db[i + 2] < thr:
+            return i / 100.0 + 0.03
+    return None
+
+
+def _quiet_before(env, t, look=0.30):
+    if env is None:
+        return None
+    db, thr = env
+    i0, i1 = min(len(db) - 1, int(t * 100)), max(2, int((t - look) * 100))
+    for i in range(i0, i1, -1):
+        if db[i] < thr and db[i - 1] < thr and db[i - 2] < thr:
+            return (i + 1) / 100.0 - 0.02
+    return None
+
+
+def _word_level(env, s, e):
+    if env is None:
+        return 0.0
+    db = env[0]
+    lo, hi = int(s * 100), max(int(s * 100) + 1, int(e * 100))
+    seg = db[lo:hi]
+    return float(seg.max()) if len(seg) else 0.0
+
+
+def _is_thai(text):
+    return any("฀" <= ch <= "๿" for ch in text or "")
+
+
+def _face_focus(src):
+    """Where to push in toward, and how far a push may go before someone is cropped.
+
+    Every face counts, not just the biggest: a two-hander pushed toward the larger
+    face cut the customer in half at 1.12x.
+    """
+    try:
+        import contextlib
+        import cv2
+        import mediapipe as mp
+        det = _face_detector()
+        cap = cv2.VideoCapture(src)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 24
+        fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1
+        fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1
+        stepf = max(1, int(round(fps / 2.0)))
+        boxes, i = [], 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if i % stepf == 0:
+                img = mp.Image(image_format=mp.ImageFormat.SRGB,
+                               data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                with contextlib.redirect_stdout(sys.stderr):
+                    res = det.detect(img)
+                for d in res.detections or []:
+                    if d.categories and d.categories[0].score < 0.6:
+                        continue    # shelf clutter and jersey numbers score 0.4-0.5
+                    b = d.bounding_box
+                    boxes.append((b.origin_x / fw, b.origin_y / fh,
+                                  (b.origin_x + b.width) / fw, (b.origin_y + b.height) / fh))
+            i += 1
+        cap.release()
+        if boxes:
+            sizes = sorted(b[2] - b[0] for b in boxes)
+            med = sizes[len(sizes) // 2]
+            boxes = [b for b in boxes if b[2] - b[0] >= med * 0.45]
+        if boxes:
+            x0 = sorted(b[0] for b in boxes)[len(boxes) // 10]
+            y0 = sorted(b[1] for b in boxes)[len(boxes) // 10]
+            x1 = sorted(b[2] for b in boxes)[len(boxes) * 9 // 10]
+            y1 = sorted(b[3] for b in boxes)[len(boxes) * 9 // 10]
+            # faces plus a margin for hair and shoulders must stay inside the crop
+            span_w, span_h = (x1 - x0) + 0.16, (y1 - y0) + 0.20
+            max_z = max(1.0, min(1.0 / max(span_w, 0.01), 1.0 / max(span_h, 0.01)))
+            cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+            # zoompan's x is (iw - iw/z) * f, so f must sit where the faces are
+            return (min(0.95, max(0.05, cx)), min(0.8, max(0.1, cy)), True, max_z)
+    except Exception:
+        pass
+    return 0.5, 0.42, False, 1.3
+
+
+BEDS_DIR = os.path.join(os.path.expanduser("~"), "Downloads", "music", "beds")
+# What each requested feel may draw from, best first. Moods come from three places:
+# auto_edit (calm/uplifting/warm/tense/gentle), human_edit (calm/normal/hype) and
+# the library's own labels.
+_BED_MOODS = {
+    "calm": ["chill", "warm"], "gentle": ["warm", "chill"], "warm": ["warm", "chill", "happy"],
+    "uplifting": ["happy", "inspiring"], "tense": ["energetic"],
+    "normal": ["happy", "inspiring", "chill"], "hype": ["energetic", "happy"],
+    "happy": ["happy"], "energetic": ["energetic"], "chill": ["chill"],
+    "inspiring": ["inspiring"],
+}
+_BED_BPM = {"calm": 85, "gentle": 75, "warm": 92, "uplifting": 110, "tense": 120,
+            "normal": 105, "hype": 125, "happy": 110, "energetic": 125, "chill": 88,
+            "inspiring": 105}
+# How far a bed sits under the voice, in LU, measured as integrated loudness.
+# Background, never competing: you notice it if you listen for it, you never
+# have to strain past it. A bed that is ducked further under speech can start
+# a little higher; one that is not, lower.
+BED_UNDER_VOICE_DUCKED = 12.0
+BED_UNDER_VOICE_FLAT = 18.0
+BED_ALONE_LUFS = -16.0          # no one talking: the music IS the soundtrack
+
+
+def _bed_library():
+    """Instrumental beds only - built by build_music_library.py, every one checked
+    by Whisper and YAMNet for singing before it was kept."""
+    cat = os.path.join(BEDS_DIR, "CATALOGUE.json")
+    if not os.path.isfile(cat):
+        return []
+    with io.open(cat, encoding="utf-8") as fh:
+        tracks = json.load(fh)
+    return [t for t in tracks if t.get("instrumental") and os.path.isfile(
+        t.get("path") or os.path.join(BEDS_DIR, t.get("file", "")))]
+
+
+def _pick_bed(mood, total, avoid=()):
+    """A real instrumental track for this feel and length. Returns (path, note) or
+    (None, why). Never synthesises - a made-up drone is what this replaced."""
+    import random
+    mood = (mood or "normal").lower()
+    want_moods = _BED_MOODS.get(mood, ["happy", "inspiring", "chill"])
+    want_bpm = _BED_BPM.get(mood, 105)
+    tracks = _bed_library()
+    if not tracks:
+        return None, ("no instrumental library yet - run build_music_library.py "
+                      "in the video-editor-mcp folder")
+    scored = []
+    for t in tracks:
+        path = t.get("path") or os.path.join(BEDS_DIR, t.get("file", ""))
+        if path in avoid:
+            continue
+        m = re.search(r"([\d.]+)\s*BPM", t.get("tempo") or "")
+        bpm = float(m.group(1)) if m else 100.0
+        diff = min(abs(bpm - want_bpm), abs(bpm * 2 - want_bpm), abs(bpm / 2 - want_bpm))
+        rank = want_moods.index(t["mood"]) if t.get("mood") in want_moods else 4
+        score = rank * 30 + diff + (40 if float(t.get("seconds") or 0) < total + 2 else 0)
+        if "FLAT" in (t.get("shape") or ""):
+            score += 8
+        scored.append((score, path, t))
+    if not scored:
+        return None, "every track was excluded"
+    scored.sort(key=lambda x: x[0])
+    # Pick among the close ones so every edit does not get the same song.
+    best = scored[0][0]
+    pool = [x for x in scored[:6] if x[0] <= best + 12]
+    _s, path, t = random.choice(pool)
+    return path, "%s - %s (%s, %s)" % (t.get("artist"), t.get("title"), t.get("mood"),
+                                      t.get("tempo"))
+
+
+def _bed_start(music):
+    """Seconds into the track where it has properly started.
+
+    Many tracks open with a quiet intro: under a 15-second ad that is no music at
+    all, and then the full band crashes in mid-sentence. Measured: havana club sits
+    at -35 LUFS for 3.7 s; Saturday runs 25 s of soft intro at -25 before the song
+    arrives at -17. So the whole track is read, its body is the level it spends
+    most of its time at or above, and the bed starts where a 3-second stretch first
+    reaches within 3 dB of that - provided enough of the track is left after it."""
+    def compute():
+        import numpy as np
+        pcm, rate = _decode_pcm(music, 8000, max_seconds=420)
+        y = np.asarray(pcm, dtype=np.float64)
+        win = rate // 2
+        if y.size < win * 12:
+            return 0.0
+        db = np.array([20 * np.log10(np.sqrt(np.mean(y[i:i + win] ** 2)) + 1e-9)
+                       for i in range(0, y.size - win, win)])
+        sm = np.convolve(db, np.ones(6) / 6.0, mode="valid")
+        body = float(np.percentile(sm, 70))
+        total = len(db) * 0.5
+        for i, v in enumerate(sm):
+            if v >= body - 3.0:
+                st = round(i * 0.5, 2)
+                if total - st < 30:
+                    return 0.0
+                # land on a beat, not mid-note
+                try:
+                    env, er = _onset_envelope(music)
+                    _bpm, beats = _beat_grid(env, er)
+                    after = [b for b in beats if b >= st - 0.25]
+                    if after:
+                        st = round(float(after[0]), 3)
+                except Exception:
+                    pass
+                return st
+        return 0.0
+    try:
+        return cached("bedstart3", music, None, compute)
+    except Exception:
+        return 0.0
+
+
+def _body_loudness(music):
+    """Loudness of the stretch of the track that is actually used - from the start
+    point, 40 seconds. Measuring the whole file lets a quiet intro or a loud finale
+    set the level of a bed that never plays them."""
+    st = _bed_start(music)
+
+    def compute():
+        err = _probe_stderr(music, ["-af", "atrim=start=%.2f:duration=40,ebur128" % st])
+        hits = re.findall(r"I:\s*(-?[\d.]+)\s*LUFS", err)
+        return float(hits[-1]) if hits else None
+    try:
+        v = cached("bodyloud2", music, st, compute)
+    except Exception:
+        v = None
+    return v if v is not None else _loudness(music)
+
+
+def _bed_gain(music, voice_src=None, ducked=False, voice_lufs=None):
+    """Linear gain that puts a bed at the right level under THIS voice.
+
+    A fixed volume number cannot do that: tracks differ by 15 dB or more in their
+    own loudness, so volume 0.22 buried a soft piano and let a mastered pop track
+    shout over the talking. Measure both, then set the gap."""
+    m_lufs = _body_loudness(music)
+    if m_lufs is None or m_lufs < -60:
+        return 0.25, "level fixed at 0.25 (could not measure the track)"
+    if voice_lufs is None and voice_src and has_audio(voice_src):
+        voice_lufs = _loudness(voice_src)
+    if voice_lufs is not None and voice_lufs > -45:
+        gap = BED_UNDER_VOICE_DUCKED if ducked else BED_UNDER_VOICE_FLAT
+        target = voice_lufs - gap
+        why = "%.0f LU under the voice (voice %.1f LUFS)" % (gap, voice_lufs)
+    else:
+        target = BED_ALONE_LUFS
+        why = "%.0f LUFS - nobody talking, so the music carries it" % target
+    g = 10 ** ((target - m_lufs) / 20.0)
+    return max(0.02, min(4.0, g)), "music set %s" % why
+
+
+def _pick_music(energy, total):
+    """A real track: the instrumental beds first, the old hand-picked folder second."""
+    path, note = _pick_bed(energy, total)
+    if path:
+        return path, note
+    folder = os.path.join(os.path.expanduser("~"), "Downloads", "music")
+    cat = os.path.join(folder, "CATALOGUE.json")
+    if not os.path.isfile(cat):
+        return None, "no music library at %s" % folder
+    with io.open(cat, encoding="utf-8") as fh:
+        tracks = json.load(fh)
+    want = HUMAN_BPM.get(energy, 105)
+    best, best_score = None, None
+    for t in tracks:
+        path = t.get("path") or os.path.join(folder, t.get("file", ""))
+        if not os.path.isfile(path):
+            continue
+        blob = ("%s %s %s" % (t.get("file"), t.get("sounds"), t.get("colour"))).lower()
+        if any(w in blob for w in _MOOD_WRONG) or "singing" in blob or "speech" in blob:
+            continue
+        m = re.search(r"([\d.]+)\s*BPM", t.get("tempo") or "")
+        bpm = float(m.group(1)) if m else 100.0
+        diff = min(abs(bpm - want), abs(bpm * 2 - want), abs(bpm / 2 - want))
+        score = diff + (25 if float(t.get("seconds") or 0) < total else 0)             + (10 if "fades away" in (t.get("shape") or "") else 0)
+        if best_score is None or score < best_score:
+            best, best_score = (path, t), score
+    if not best:
+        return None, "nothing in the library suits a talking ad"
+    path, t = best
+    return path, "%s (%s)" % (os.path.basename(path), t.get("tempo"))
+
+
+def _reference_pace(ref):
+    """Read a reference video's rhythm: how often the picture changes."""
+    total = video_duration_of(ref)
+    cuts = [c for c in _scene_cuts(ref, 8.0) if 0.3 < c < total - 0.3]
+    shot = total / float(len(cuts) + 1)
+    energy = "hype" if shot < 1.6 else "normal" if shot < 3.2 else "calm"
+    return energy, shot, len(cuts), total
+
+
+def _zoom_expr(base, drift, punch, n_total, n_punch, n_ramp):
+    """Per-output-frame zoom: a slow drift across the piece plus an eased punch."""
+    z = "%.4f" % base
+    if drift > 0:
+        z += "+%.4f*min(on/%.1f,1)" % (drift, max(1.0, n_total))
+    if punch > 0 and n_punch is not None:
+        u = "clip((on-%.1f)/%.1f,0,1)" % (n_punch, max(1.0, n_ramp))
+        z += "+%.4f*(3*pow(%s,2)-2*pow(%s,3))" % (punch, u, u)
+    return z
+
+
+def _render_piece(src, seg, W, H, fps, out):
+    dur = seg["e"] - seg["s"]
+    vgain = float(seg.get("vgain") or 0.0)
+    rate = float(fps)
+    n_punch = seg["punch_at"] * rate if seg.get("punch_at") is not None else None
+    z = _zoom_expr(seg["base"], seg["drift"], seg["punch"] if n_punch is not None else 0,
+                   dur * rate, n_punch, 0.22 * rate)
+    fx, fy = seg["focus"]
+    # Upscale 2x before zoompan: it places the crop on whole input pixels, and at
+    # the delivery size that rounding shows as a shimmer on every slow push.
+    vf = ("scale=%d:%d:force_original_aspect_ratio=increase:flags=lanczos,crop=%d:%d,"
+          "fps=%d,zoompan=z='%s':d=1:x='(iw-iw/zoom)*%.4f':y='(ih-ih/zoom)*%.4f':"
+          "s=%dx%d:fps=%d,setsar=1,format=yuv420p"
+          % (W * 2, H * 2, W * 2, H * 2, fps, esc_expr(z), fx, fy, W, H, fps))
+    args = ["-ss", "%.3f" % seg["s"], "-i", src, "-t", "%.3f" % dur, "-vf", vf,
+            "-frames:v", str(max(1, int(round(dur * fps))))]
+    if has_audio(src):
+        # Tiny fades at both ends: a cut through a waveform clicks.
+        # Exactly as long as the picture, in PCM. AAC pads every piece to a whole
+        # 1024-sample frame, and five pieces of padding put the last line 0.17s
+        # behind the mouth.
+        # 60 ms out: a take that ends on a laugh or a clatter otherwise stops dead
+        # at the cut (measured: a giggle at -4 dBFS dropping to -23 on the frame).
+        args += ["-af", "aresample=48000,volume=%.2fdB,afade=t=in:st=0:d=0.015,"
+                        "afade=t=out:st=%.3f:d=0.06,apad,atrim=0:%.4f"
+                 % (vgain, max(0.0, dur - 0.06), dur), "-c:a", "pcm_s16le"]
+    else:
+        args += ["-f", "lavfi", "-t", "%.3f" % dur, "-i", "anullsrc=r=48000:cl=stereo",
+                 "-map", "0:v", "-map", "1:a", "-shortest", "-c:a", "pcm_s16le"]
+    ffmpeg_run(args + FAST_ENC + [out])
+    return out
+
+
+# Thai words a caption card must not END on - they lean forward into the next
+# word ("ของ|ช่าง", "ใน|เน็ต"), so a card that stops there reads as cut off.
+TH_LEAN = frozenset("""ของ ใน ที่ จาก กับ และ แต่ หรือ ให้ เป็น ว่า ก็ จะ ได้ไป ถ้า
+เพราะ แล้วก็ คือ ซึ่ง โดย เพื่อ ต่อ ถึง ตาม แค่ อย่าง เมื่อ ยัง ไม่ ไม่ได้ ช่วย มา ไป""".split())
+# ...and words a card should not START on - particles that close the line before.
+TH_TAIL = frozenset("ครับ ค่ะ คะ นะ จ้า จ้ะ เลย ด้วย นะครับ นะคะ เนอะ สิ ล่ะ".split())
+# ...and words that cannot open a LINE because they finish the phrase before them
+# ("ถูก|กว่า", "กันน้ำ|รั่ว", "ใช้|ได้").
+TH_NOLINE = TH_TAIL | frozenset("""กว่า ได้ ไม่ได้ มาก ที่สุด อยู่ แล้ว ขึ้น ลง ออก
+รั่ว หมด ไหว เป็น จริง เยอะ ตั้ง""".split())
+# Words an ad is built on: when one is said, it is the point of the line.
+TH_AD = frozenset("""ถูก แพง ฟรี ลด คุ้ม ทน พัง ดี เร็ว ใหม่ แท้ ปลอม เสีย ประหยัด
+cheap free new fast best save""".split())
+# Never the coloured word: particles and grammar carry no meaning on their own.
+TH_PLAIN = TH_LEAN | TH_TAIL | frozenset("""ก็ ๆ แล้ว นี้ นั้น นี่ มัน เขา เรา คุณ ผม หนู
+ต้อง ใช้ มี ทุก ได้ ให้ อ้าว เอ๊ะ โอ้ อืม""".split())
+EN_PLAIN = frozenset("""a an the of to in on at for and or but so is are was were be it this
+that with from by as i you we they he she my your our just really very""".split())
+UNITS = frozenset("บาท ปี วัน เดือน นาที ชั่วโมง เท่า % ชิ้น อัน ตัว เมตร ลิตร กิโล baht".split())
+
+
+# Consonants that sound the same in Thai. The recogniser picks by sound, so when it
+# writes a word that is not in the dictionary, the right spelling is very often one
+# of these swaps away ("ทูก" for ถูก). Vowels are left alone - swapping those
+# changes the word ("ทุก").
+_TH_ALIKE = ["ทถธฑฒ", "ตฏ", "ดฎ", "คฆขฅ", "กข", "พภผ", "ฟฝ", "สศษซ", "ชฌฉ",
+             "ยญ", "นณ", "ลฬร", "จ", "บป", "ฮห", "อ", "งง"]
+_TH_DICT = None
+_TH_FREQ = None
+
+
+def _th_spellfix(word, keep=()):
+    """A recogniser misspelling -> the dictionary word one sound-alike consonant
+    away, most common first. Unknown words with no such neighbour are left alone:
+    a name or a brand is not a typo."""
+    global _TH_DICT, _TH_FREQ
+    w = word.strip()
+    if len(w) < 2 or not re.search(r"[\u0e01-\u0e2e]", w) or w in keep:
+        return word
+    try:
+        if _TH_DICT is None:
+            from pythainlp.corpus import thai_words
+            from pythainlp.corpus.tnc import word_freqs
+            # frequencies first: the clips are read in parallel threads, and the
+            # dictionary being set is what tells another thread both are ready
+            _TH_FREQ = dict(word_freqs())
+            _TH_DICT = set(thai_words())
+    except Exception:
+        return word
+    if w in _TH_DICT or any(w in k for k in keep):
+        return word
+    best, best_f = None, 0
+    for i, ch in enumerate(w):
+        for grp in _TH_ALIKE:
+            if ch in grp:
+                for alt in grp:
+                    if alt == ch:
+                        continue
+                    cand = w[:i] + alt + w[i + 1:]
+                    f = _TH_FREQ.get(cand, 0)
+                    if cand in _TH_DICT and f > best_f * 1.0 and f >= 200:
+                        best, best_f = cand, f
+    if not best:
+        # A stray tone mark is the other common slip ("ไข้ควง" for ไขควง): try the
+        # word without each one. The result is a character shorter, so this is only
+        # used where the caller does not need the length kept.
+        for i, ch in enumerate(w):
+            if ch in "่้๊๋":
+                cand = w[:i] + w[i + 1:]
+                f = _TH_FREQ.get(cand, 0)
+                if cand in _TH_DICT and f >= 5 and f > best_f:
+                    best, best_f = cand, f
+    return word.replace(w, best) if best else word
+
+
+def t_human_edit(a):
+    """Raw clips in, a finished cut out - edited the way a person edits.
+
+    The other one-command tools assemble; this one makes the small decisions a human
+    editor makes on every line: cut the pauses and the ums, cut on silence rather than
+    on whisper's word ends, alternate the framing on a jump cut so it reads as a second
+    camera, push in on the stressed word, keep the picture from sitting still too long,
+    duck the music under the voice, and put a sound only where something happens.
+    Then it measures its own result and says what it would still fix.
+    """
+    paths = a.get("paths") or ([a["path"]] if a.get("path") else [])
+    if not paths:
+        raise ToolError("Give 'paths': the raw clips, in play order.")
+    srcs = [check_input(p, "video") for p in paths]
+    lang = a.get("language") or "auto"
+    model = a.get("model") or "large-v3"
+    notes = []
+
+    # --- 1. how this cut should breathe ------------------------------------------
+    energy = a.get("energy")
+    if a.get("reference"):
+        ref = check_input(a["reference"], "reference video")
+        r_energy, r_shot, r_cuts, r_total = _reference_pace(ref)
+        energy = energy or r_energy
+        pace = dict(HUMAN_PACE[energy])
+        pace["static"] = max(1.2, min(5.0, r_shot * 1.25))
+        notes.append("Reference %s: %d picture changes in %.0fs = one every %.1fs, so "
+                     "'%s' pace, picture never still longer than %.1fs."
+                     % (os.path.basename(ref), r_cuts, r_total, r_shot, energy,
+                        pace["static"]))
+    else:
+        energy = energy or "normal"
+        if energy not in HUMAN_PACE:
+            raise ToolError("energy must be calm, normal or hype.")
+        pace = dict(HUMAN_PACE[energy])
+        notes.append("'%s' pace (no reference given)." % energy)
+
+    # --- 2. delivery size ---------------------------------------------------------
+    info = probe(srcs[0])
+    vs = next((s for s in info["streams"] if s.get("codec_type") == "video"), {})
+    sw, sh = int(vs.get("width", 1080)), int(vs.get("height", 1920))
+    W, H = (1080, 1920) if sh >= sw else (1920, 1080)
+    fps = int(a.get("fps") or 30)
+
+    # --- 3. read every clip: words, loudness, movement, face ----------------------
+    def read(src, want_lang):
+        env = None
+        try:
+            env = _env100(src) if has_audio(src) else None
+        except ImportError:
+            raise ToolError("video_human_edit needs numpy: python -m pip install numpy")
+        except ToolError:
+            env = None
+        words, said = [], None
+        if env is not None:
+            try:
+                words, said = _word_timings(src, want_lang, model)
+            except ToolError:
+                words = []
+        return {"src": src, "env": env, "words": words, "lang": said,
+                "dur": video_duration_of(src), "motion": _motion_curve(src, 10)}
+
+    with ThreadPoolExecutor(max_workers=min(3, len(srcs))) as ex:
+        clips = list(ex.map(lambda s: read(s, lang), srcs))
+    if lang == "auto":
+        # Language is decided ONCE for the whole film. Per clip, a two-second line
+        # gets heard as anything - a Thai "ถูกจริง พังจริง" came back as Vietnamese.
+        votes = {}
+        for c in clips:
+            if c["lang"]:
+                votes[c["lang"]] = votes.get(c["lang"], 0) + len(c["words"])
+        if votes:
+            lang = max(votes, key=votes.get)
+            for i, c in enumerate(clips):
+                if c["words"] and c["lang"] != lang:
+                    clips[i] = read(c["src"], lang)
+            notes.append("Language: %s, decided across all clips." % lang)
+    for c in clips:
+        c["focus"] = _face_focus(c["src"])
+    # One voice, one level: clips recorded at different gains jump 3-4 LU at the
+    # cut. Match every talking clip to the middle one, within +-6 dB.
+    # Measured on the words alone - a clip's whole-file loudness includes the other
+    # person, the wrench, the room, and left voices 2 LU apart after "matching".
+    def _speech_level(c):
+        if c["env"] is None or not c["words"]:
+            return None
+        import numpy as np
+        db = c["env"][0]
+        idx = [i for w in c["words"] for i in range(int(w["s"] * 100),
+                                                   min(len(db), int(w["e"] * 100)))]
+        if len(idx) < 20:
+            return None
+        p = np.mean(10 ** (np.asarray(db)[idx] / 10.0))
+        return float(10 * np.log10(p + 1e-12))
+    lv = {i: _speech_level(c) for i, c in enumerate(clips) if c["words"]}
+    lv = {i: v for i, v in lv.items() if v is not None and v > -60}
+    mid_lv = statistics.median(lv.values()) if lv else None
+    for i, c in enumerate(clips):
+        c["vgain"] = max(-6.0, min(6.0, mid_lv - lv[i])) if i in lv else 0.0
+
+    # --- 4. takes: keep speech and action, cut dead air and fillers, on silence ----
+    # Dead air is a pause where NOTHING happens. A silent wrench being bent is the
+    # story, so a stretch is kept if someone speaks OR the picture moves.
+    segs, fillers_cut = [], []
+    step = 0.1
+    for ci, c in enumerate(clips):
+        env, words, dur = c["env"], c["words"], c["dur"]
+        n = int(math.ceil(dur / step))
+        keep = [False] * n
+        mo = list(c["motion"] or [])
+        if len(mo) >= 5:
+            sm = [statistics.mean(mo[max(0, i - 1):i + 2]) for i in range(len(mo))]
+            # Measured on three AI shots: idle frames sat at 0.4-2.0, real action at
+            # 2.7-11.6. The quarter-percentile doubled lands between them and moves
+            # with footage that is busier overall (a camera drift lifts everything).
+            q = sorted(sm)[len(sm) // 4]
+            thr = max(2.5, q * 2.0)
+            for i, v in enumerate(sm[:n]):
+                if v > thr:
+                    keep[i] = True
+        # A sound is something happening too: a spoon bending against a paint tin
+        # barely moves the picture but is the whole setup of the ad. Counted only
+        # where the clip has real quiet in it, so a bed of music in the source does
+        # not keep every frame.
+        if env is not None:
+            db_, thr_ = env
+            import numpy as _np
+            if float(_np.percentile(db_, 90) - _np.percentile(db_, 10)) > 15:
+                run_start = None
+                for k in range(len(db_) + 1):
+                    loud = k < len(db_) and db_[k] > thr_
+                    if loud and run_start is None:
+                        run_start = k
+                    elif not loud and run_start is not None:
+                        if k - run_start >= 15:
+                            for i in range(run_start // 10, min(n, k // 10 + 1)):
+                                keep[i] = True
+                        run_start = None
+        runs, cur = [], []
+        fill_spans = []
+        for w in words:
+            bare = re.sub(r"[^\w\u0e00-\u0e7f]", "", w["t"].lower())
+            if bare in FILLER_WORDS:
+                fillers_cut.append(w["t"].strip())
+                fill_spans.append((w["s"], w["e"]))
+                if cur:
+                    runs.append(cur)
+                cur = []
+                continue
+            if cur and w["s"] - cur[-1]["e"] > pace["gap"]:
+                runs.append(cur)
+                cur = []
+            cur.append(w)
+        if cur:
+            runs.append(cur)
+        speech = []
+        for run in runs:
+            s0, e0 = run[0]["s"], run[-1]["e"]
+            s = _quiet_before(env, s0)
+            e = _quiet_after(env, e0)
+            s = max(0.0, s if s is not None else s0 - 0.06)
+            e = min(dur, max(e if e is not None else e0, e0) + pace["pad"] * 0.5)
+            speech.append((s, e))
+            for i in range(int(s / step), min(n, int(math.ceil(e / step)))):
+                keep[i] = True
+        for s, e in fill_spans:
+            for i in range(int(s / step), min(n, int(math.ceil(e / step)))):
+                keep[i] = False
+        # A tiny gap is not worth a cut, and a flicker of action is not a take.
+        spans, i = [], 0
+        while i < n:
+            if keep[i]:
+                j = i
+                while j < n and keep[j]:
+                    j += 1
+                spans.append([i * step, min(dur, j * step)])
+                i = j
+            else:
+                i += 1
+        merged = []
+        for sp in spans:
+            if merged and sp[0] - merged[-1][1] < 0.3:
+                merged[-1][1] = sp[1]
+            else:
+                merged.append(sp)
+        # speech edges were found on silence - put them back exactly
+        for sp in merged:
+            for s, e in speech:
+                if abs(sp[0] - s) < step * 1.5:
+                    sp[0] = s
+                if abs(sp[1] - e) < step * 1.5:
+                    sp[1] = e
+        merged = [sp for sp in merged if sp[1] - sp[0] >= 0.6 or
+                  any(s < sp[1] and e > sp[0] for s, e in speech)]
+        if not merged:
+            # nothing moved and nobody spoke - keep the liveliest bit as a cutaway
+            hold = min(dur, pace["static"] * 1.2)
+            mid = _busiest_moment(c["src"]) or dur / 2.0
+            s = max(0.0, min(dur - hold, mid - hold / 2.0))
+            merged = [[s, s + hold]]
+        # Air inside a take: a human trims it to the words. Lead-in at most 0.5s,
+        # tail at most 0.35s - except where the clip moves on to another place, which
+        # is handled later. A wordless cutaway earns 2.2s at most.
+        trimmed = []
+        mo_all = list(c["motion"] or [])
+        for s, e in merged:
+            inside = [w for w in words if s <= (w["s"] + w["e"]) / 2 < e]
+            if inside:
+                lead = inside[0]["s"] - s
+                if lead > 2.0 and len(mo_all) > 5:
+                    # A long run of action before the line (the leak spraying, the
+                    # wrench going down) is its own shot: keep its busiest 1.6s as a
+                    # cutaway, then start the line 0.4s before the first word.
+                    lo_i, hi_i = int(s * 10), int((inside[0]["s"] - 0.5) * 10)
+                    win = 16
+                    if hi_i - lo_i > win:
+                        best_i = max(range(lo_i, hi_i - win + 1),
+                                     key=lambda j: sum(mo_all[j:j + win]))
+                        trimmed.append([best_i / 10.0, best_i / 10.0 + win / 10.0])
+                    s = inside[0]["s"] - 0.4
+                else:
+                    s = max(s, inside[0]["s"] - (0.35 if ci == 0 else 1.6))
+                e = min(e, inside[-1]["e"] + 0.4)
+            elif e - s > 2.2:
+                e = s + 2.2
+            if e - s >= 0.25:
+                trimmed.append([s, e])
+        merged = trimmed
+        for s, e in merged:
+            segs.append({"clip": ci, "s": s, "e": e,
+                         "words": [w for w in words if s <= (w["s"] + w["e"]) / 2 < e
+                                   and re.sub(r"[^\w\u0e00-\u0e7f]", "",
+                                              w["t"].lower()) not in FILLER_WORDS]})
+    segs = [g for g in segs if g["e"] - g["s"] >= 0.25]
+    if not segs:
+        raise ToolError("Nothing worth keeping was found in these clips.")
+
+    # Open on a voice. A wordless shot of hands as frame one is the slowest
+    # possible hook - nobody has said why to keep watching yet.
+    if any(g["words"] for g in segs):
+        while segs and not segs[0]["words"]:
+            g0 = segs[0]
+            mo = list(clips[g0["clip"]]["motion"] or [])
+            med = statistics.median(mo) if mo else 0.0
+            seg_mo = mo[int(g0["s"] * 10):int(g0["e"] * 10)]
+            peak = max(seg_mo) if seg_mo else 0.0
+            env0 = clips[g0["clip"]]["env"]
+            loud0 = 0
+            if env0 is not None:
+                loud0 = sum(1 for v in env0[0][int(g0["s"] * 100):int(g0["e"] * 100)]
+                            if v > env0[1])
+            own_scene = True
+            if len(segs) > 1 and segs[1]["clip"] == g0["clip"] and segs[1]["words"]:
+                try:
+                    cuts0 = _scene_cuts(clips[g0["clip"]]["src"], 8.0)
+                except Exception:
+                    cuts0 = []
+                own_scene = any(g0["s"] < c <= segs[1]["s"] + 0.3 for c in cuts0)
+            if own_scene and (peak > max(5.0, med * 2.5) or loud0 >= 30):
+                # the nail bending, the wrench going down - keep the busiest 1.5s
+                n = 15
+                lo, hi = int(g0["s"] * 10), int(g0["e"] * 10)
+                if hi - lo > n:
+                    j = max(range(lo, hi - n + 1), key=lambda k: sum(mo[k:k + n]))
+                    g0["s"], g0["e"] = j / 10.0, j / 10.0 + n / 10.0
+                notes.append("Opened on %.1fs of action before the first line."
+                             % (g0["e"] - g0["s"]))
+                break
+            notes.append("Dropped a %.1fs wordless opening - the cut starts on the "
+                         "first line." % (g0["e"] - g0["s"]))
+            segs.pop(0)
+
+    # A take longer than the picture may sit still splits at its widest pause
+    # between words. Both halves come from the same clip, so the join reframes
+    # (wide -> tight) like a second camera instead of holding one shot for 6s.
+    def _split_long(g):
+        ws = g["words"]
+        if (g["e"] - g["s"]) <= pace["static"] * 1.25 or len(ws) < 4:
+            return [g]
+        lo, hi = g["s"] + (g["e"] - g["s"]) * 0.3, g["s"] + (g["e"] - g["s"]) * 0.7
+        cands = [(ws[k]["s"] - ws[k - 1]["e"], k) for k in range(1, len(ws))
+                 if lo <= ws[k]["s"] <= hi and ws[k]["s"] - ws[k - 1]["e"] >= 0.15
+                 and ws[k]["s"] - g["s"] >= 1.2 and g["e"] - ws[k - 1]["e"] >= 1.2]
+        if not cands:
+            return [g]
+        gap, k = max(cands)
+        at = (ws[k - 1]["e"] + ws[k]["s"]) / 2.0
+        a_ = dict(g, e=at, words=ws[:k])
+        b_ = dict(g, s=at, words=ws[k:])
+        return _split_long(a_) + _split_long(b_)
+    segs = [p for g in segs for p in _split_long(g)]
+
+    # A run of wordless takes back to back (a stare, then the wrench, then the
+    # reaction) read as a 3-second hole - the clearest "auto-cut" sign the judges
+    # found. Together they get about 1.8s: each keeps its busiest part, none less
+    # than 0.6s.
+    def _busiest(clip, s0, e0, length):
+        mo = list(clip["motion"] or [])
+        lo, hi = int(s0 * 10), int(e0 * 10)
+        n = max(1, int(round(length * 10)))
+        if len(mo) < hi or hi - lo <= n:
+            return s0, s0 + length
+        j = max(range(lo, hi - n + 1), key=lambda k: sum(mo[k:k + n]))
+        return j / 10.0, j / 10.0 + n / 10.0
+    def _motion_sum(g):
+        mo = list(clips[g["clip"]]["motion"] or [])
+        return sum(mo[int(g["s"] * 10):int(g["e"] * 10)]) / max(0.1, g["e"] - g["s"])
+    i = 0
+    while i < len(segs):
+        if segs[i]["words"]:
+            i += 1
+            continue
+        j = i
+        while j < len(segs) and not segs[j]["words"]:
+            j += 1
+        if j - i > 2:
+            # three silent shots in 1.7s read as jump cuts - keep the two liveliest
+            keep_ids = set(id(g) for g in sorted(segs[i:j], key=_motion_sum)[-2:])
+            for g in segs[i:j]:
+                if id(g) not in keep_ids:
+                    g["drop"] = True
+            segs[:] = [g for g in segs if not g.get("drop")]
+            j = i
+            while j < len(segs) and not segs[j]["words"]:
+                j += 1
+        run = segs[i:j]
+        total_run = sum(g["e"] - g["s"] for g in run)
+        budget = 1.3
+        if total_run > budget:
+            scale = budget / total_run
+            for g in run:
+                want = max(0.5, (g["e"] - g["s"]) * scale)
+                if want < g["e"] - g["s"]:
+                    g["s"], g["e"] = _busiest(clips[g["clip"]], g["s"], g["e"], want)
+        i = j
+
+    # The generated clips have camera cuts INSIDE them. A take that starts 0.1s
+    # before one becomes a 3-frame flash of the previous angle. Snap take edges to
+    # any inner cut within 0.4s - unless a word would be lost - and a wordless take
+    # straddling a cut keeps its longer side.
+    for g in segs:
+        try:
+            inner = [c for c in _scene_cuts(clips[g["clip"]]["src"], 8.0)
+                     if g["s"] < c < g["e"]]
+        except Exception:
+            inner = []
+        if not inner:
+            continue
+        w0 = min((w["s"] for w in g["words"]), default=None)
+        w1 = max((w["e"] for w in g["words"]), default=None)
+        for c in inner:
+            if c - g["s"] < 0.4 and (w0 is None or w0 >= c):
+                g["s"] = c
+            elif g["e"] - c < 0.4 and (w1 is None or w1 <= c):
+                g["e"] = c
+        if not g["words"]:
+            inner = [c for c in inner if g["s"] < c < g["e"]]
+            for c in inner:
+                if c - g["s"] >= g["e"] - c:
+                    g["e"] = c
+                else:
+                    g["s"] = c
+    segs = [g for g in segs if g["e"] - g["s"] >= 0.4]
+
+    # --- 5. stressed words ---------------------------------------------------------
+    for c in clips:
+        lv = [_word_level(c["env"], w["s"], w["e"]) for w in c["words"]]
+        if len(lv) >= 4:
+            mean = statistics.mean(lv)
+            sd = statistics.pstdev(lv) or 1.0
+            for w, l in zip(c["words"], lv):
+                w["stress"] = (l - mean) / sd + (1.5 if re.search(r"\d", w["t"]) else 0)
+    last_punch = -99.0
+    t_out = 0.0
+    for g in segs:
+        best = None
+        for w in g["words"]:
+            st = w.get("stress", 0)
+            bonus = 1.0 if w["t"].strip().lower() in TH_AD else 0.0
+            if _visible_len(w["t"].strip()) >= 2 and st + bonus > 1.0 and \
+                    w["t"].strip().lower() not in TH_PLAIN and \
+                    w["t"].strip().lower() not in TH_NOLINE and \
+                    (best is None or st + bonus > best.get("stress", 0) + (
+                        1.0 if best["t"].strip().lower() in TH_AD else 0.0)):
+                best = w
+        at = (best["s"] - g["s"]) if best else None
+        g_len = g["e"] - g["s"]
+        names_here = [w for w in g["words"] if any(
+            n.startswith(w["t"].strip()) and w["t"].strip() for n in (a.get("names") or []))]
+        if names_here and clips[g["clip"]]["focus"][2]:
+            best = names_here[0]                # push in on the shop's name
+            at = best["s"] - g["s"]
+        if best and 0.9 <= at <= g_len - 0.9 and g_len >= 1.8 \
+                and t_out + at - last_punch >= 2.5 and clips[g["clip"]]["focus"][2]:
+            g["punch_at"], g["stress_word"] = max(0.0, at - 0.12), best["t"].strip()
+            last_punch = t_out + at
+        t_out += g["e"] - g["s"]
+
+    # --- 6. running time --------------------------------------------------------------
+    target = float(a.get("target_seconds") or 0)
+    dropped = []
+    if target:
+        while sum(g["e"] - g["s"] for g in segs) > target * 1.05 and len(segs) > 2:
+            mid = segs[1:-1]
+            worst = min(mid, key=lambda g: (len(g["words"]) / max(0.3, g["e"] - g["s"]))
+                        + (2 if g.get("punch_at") is not None else 0))
+            dropped.append("".join(w["t"] for w in worst["words"]).strip() or "(cutaway)")
+            segs.remove(worst)
+
+    # Let a line land: when the next take is somewhere else, hold the speaker for a
+    # beat after the last word (if the clip has it and no more words follow).
+    for i in range(len(segs) - 1):
+        g, nx = segs[i], segs[i + 1]
+        if g["words"] and nx["clip"] != g["clip"]:
+            later = [w["s"] for w in clips[g["clip"]]["words"] if w["s"] >= g["e"]]
+            room = (min(later) if later else clips[g["clip"]]["dur"]) - g["e"] - 0.1
+            g["e"] += max(0.0, min(0.3, room))
+
+    # End on a beat, not on the last syllable: hold what the camera saw after the
+    # final word (a smile, a nod) so the line can land and the music can resolve.
+    if segs and segs[-1]["words"]:
+        g = segs[-1]
+        room = clips[g["clip"]]["dur"] - g["e"]
+        last_w = max((w["e"] for w in g["words"]), default=g["e"])
+        want_end = last_w + 1.0
+        env = clips[g["clip"]]["env"]
+        if env is not None:
+            db, thr = env
+            i0 = int((last_w + 0.3) * 100)
+            i1 = min(len(db) - 1, int((last_w + 1.2) * 100))
+            onset = next((i for i in range(i0, i1) if db[i] > thr + 3), None)
+            if onset is not None:
+                t_on = onset / 100.0
+                stop = next((i for i in range(onset, min(len(db) - 3, onset + 90))
+                             if db[i] < thr and db[i + 1] < thr and db[i + 2] < thr), None)
+                want_end = max(last_w + 0.45, t_on - 0.15)
+        g["e"] = max(g["e"], min(want_end, clips[g["clip"]]["dur"] - 0.05))
+
+    # --- 7. framing: second camera on jump cuts, drift on long holds ----------------
+    flip = False
+    for i, g in enumerate(segs):
+        # Two talking shots of the same person at the same size, back to back, read
+        # as a jump even when they come from different clips - reframe those too.
+        jump = i > 0 and (segs[i - 1]["clip"] == g["clip"] or (
+            clips[segs[i - 1]["clip"]]["focus"][2] and clips[g["clip"]]["focus"][2]))
+        flip = (not flip) if jump else False
+        cap = clips[g["clip"]]["focus"][3]
+        g["base"] = min(pace["alt"], cap) if flip else 1.0
+        g["focus"] = clips[g["clip"]]["focus"][:2]
+        g["punch"] = max(0.0, min(pace["punch"], cap - g["base"]))
+        g["join"] = "cut"
+        if flip and g["base"] < 1.04:
+            # Too tight to reframe (two people filling the frame): a 2% change reads
+            # as a wobble. Inside one clip, soften the jump with a few frames of
+            # dissolve; between two clips a dissolve ghosts two scenes together, so
+            # it stays a plain cut.
+            g["base"] = 1.0
+            if segs[i - 1]["clip"] == g["clip"]:
+                g["join"] = "fade"
+        if g["base"] > 1.0 and g.get("punch_at") is not None and (g["e"] - g["s"]) < 3.0:
+            g.pop("punch_at", None)
+            g.pop("stress_word", None)
+        g["punch"] = g["punch"] if g.get("punch_at") is not None else 0.0
+        long_still = (g["e"] - g["s"]) > pace["static"]
+        g["drift"] = 0.05 if long_still else 0.0
+        if i == len(segs) - 1 and (g["e"] - g["s"]) > 2.0:
+            g["drift"] = 0.08
+
+    # Every take a whole number of frames. A 7.31s take is 219 frames = 7.300s of
+    # picture; the build positions each join from the listed length, the hundredths
+    # pile up, and once a join lands past the end of its picture xfade ends the whole
+    # video there - six of ten Boonchai cuts stopped mid-film with the sound running on.
+    for g in segs:
+        g["e"] = g["s"] + max(1, int(round((g["e"] - g["s"]) * fps))) / float(fps)
+
+    # --- 8. the timeline the build will produce -------------------------------------
+    SOFT = 0.12
+    offs, t = [], 0.0
+    for i, g in enumerate(segs):
+        if i:
+            # a build "cut" eats one frame, a dissolve eats its own length
+            t -= SOFT if g.get("join") == "fade" else 1.0 / fps
+        offs.append(t)
+        t += g["e"] - g["s"]
+    total = t
+
+    # captions: one breath per card, the way a person types them in CapCut.
+    # What gave the old ones away as machine-made (Boonchai test, 20 Oct):
+    #   - a lone word on its own card ("ไหน") because a width limit fell there
+    #   - a card hanging on over a cut into a different shot
+    #   - every single word lighting up in turn
+    # So: break at pauses and at cuts first, width second; fold any scrap back
+    # into its neighbour; show the card a beat before the voice; light only the
+    # one word the speaker leans on.
+    cues = []
+    if a.get("captions", True):
+        flat = []
+        keep_names = tuple(a.get("names") or ())
+        spell_fixed = []
+        for gi, (g, o) in enumerate(zip(segs, offs)):
+            for w in g["words"]:
+                t_fixed = _th_spellfix(w["t"], keep_names)
+                if t_fixed != w["t"]:
+                    spell_fixed.append("%s->%s" % (w["t"].strip(), t_fixed.strip()))
+                flat.append({"t": t_fixed, "s": o + w["s"] - g["s"], "e": o + w["e"] - g["s"],
+                             "seg": gi, "stress": w.get("stress", 0.0)})
+        # A script beats any spell-check: "แต่ปู" for ตะปู is two real words, so
+        # no dictionary can catch it. Line the script up against what was heard,
+        # character by character, and give each heard word the script's letters
+        # for the same stretch - keeping the heard word's timing.
+        script = a.get("script")
+        if isinstance(script, list):
+            script = " ".join(script)
+        if script and flat:
+            import difflib
+            heard = [w["t"] for w in flat]
+            h_ns, h_word = [], []
+            for wi, t_ in enumerate(heard):
+                for ch in t_:
+                    if not ch.isspace():
+                        h_ns.append(ch)
+                        h_word.append(wi)
+            s_ns = "".join(ch for ch in script if not ch.isspace())
+            sm = difflib.SequenceMatcher(None, "".join(h_ns), s_ns, autojunk=False)
+            ratio = sm.ratio()
+            if h_ns and ratio >= 0.5:
+                to_s = [0] * len(h_ns)
+                for tag, i1, i2, j1, j2 in sm.get_opcodes():
+                    for k in range(i1, i2):
+                        to_s[k] = j1 + (k - i1 if tag == "equal" else
+                                        int((k - i1) * (j2 - j1) / float(max(1, i2 - i1))))
+                firsts = {}
+                lasts = {}
+                for k, wi in enumerate(h_word):
+                    firsts.setdefault(wi, k)
+                    lasts[wi] = k
+                order = sorted(firsts)
+                changed = 0
+                for n_, wi in enumerate(order):
+                    a_s = to_s[firsts[wi]]
+                    if n_ + 1 < len(order):
+                        b_s = to_s[firsts[order[n_ + 1]]]
+                        # script text nobody said (a whole extra line) is not
+                        # pinned onto the word before it
+                        if b_s - (to_s[lasts[wi]] + 1) > 12:
+                            b_s = to_s[lasts[wi]] + 1
+                    else:
+                        b_s = to_s[lasts[wi]] + 1
+                    new_t = s_ns[a_s:max(a_s, b_s)]
+                    if new_t and new_t != heard[wi].strip():
+                        lead = " " if heard[wi][:1] == " " else ""
+                        flat[wi]["t"] = lead + new_t
+                        changed += 1
+                notes.append("Captions spelt from the script (%.0f%% match, %d word(s) "
+                             "changed)." % (ratio * 100, changed))
+            else:
+                notes.append("Script given but it matches what was said only %.0f%% - "
+                             "captions use what was heard." % (ratio * 100))
+
+        # two recognised pieces that are really one misspelt word ("ไข้|ควง" ->
+        # ไขควง): merge them into the corrected word, first start to last end
+        k = 0
+        while k + 1 < len(flat):
+            a_w, b_w = flat[k], flat[k + 1]
+            pair = a_w["t"].strip() + b_w["t"].strip()
+            if a_w["seg"] == b_w["seg"] and a_w["t"].strip() and b_w["t"].strip():
+                fixed_pair = _th_spellfix(pair, keep_names)
+                if fixed_pair != pair:
+                    spell_fixed.append("%s->%s" % (pair, fixed_pair))
+                    flat[k] = dict(a_w, t=fixed_pair, e=b_w["e"],
+                                   stress=max(a_w["stress"], b_w["stress"]))
+                    del flat[k + 1]
+                    continue
+            k += 1
+        if spell_fixed:
+            notes.append("Spelling corrected: %s" % ", ".join(spell_fixed))
+        thai = _is_thai("".join(w["t"] for w in flat))
+        limit = 14 if thai else 20          # one comfortable line at font_scale 1.9
+        small = 8 if thai else 9            # a card shorter than this is a scrap
+        names = [n for n in (a.get("names") or []) if n]
+
+        def joined(ws):
+            return ("".join(w["t"] for w in ws) if thai
+                    else " ".join(w["t"].strip() for w in ws)).strip()
+
+        # 1. breath groups: a pause or a cut always ends a card
+        groups, cur = [], []
+        for w in flat:
+            if cur and (w["seg"] != cur[-1]["seg"] or w["s"] - cur[-1]["e"] > 0.25):
+                groups.append(cur)
+                cur = []
+            cur.append(w)
+        if cur:
+            groups.append(cur)
+
+        # 2. a group too wide for two lines splits at its longest inner pause,
+        #    or failing that at the most even point - never mid-word
+        def split(ws):
+            if _visible_len(joined(ws)) <= limit * 2 or len(ws) < 2:
+                return [ws]
+            gaps = [(ws[k]["s"] - ws[k - 1]["e"], k) for k in range(1, len(ws))]
+            best_gap, k = max(gaps)
+            if best_gap < 0.08:
+                k = min(range(1, len(ws)), key=lambda k: abs(
+                    _visible_len(joined(ws[:k])) - _visible_len(joined(ws[k:]))))
+            return split(ws[:k]) + split(ws[k:])
+        cards = [c for g in groups for c in split(g)]
+
+        def bare(w):
+            return w["t"].strip().lower()
+
+        # 2b. a card never ends on a word that leans into the next, nor starts on a
+        #     closing particle - move the word across within the same shot
+        for i in range(len(cards) - 1):
+            a_, b_ = cards[i], cards[i + 1]
+            if a_[-1]["seg"] != b_[0]["seg"]:
+                continue
+            while len(a_) > 1 and bare(a_[-1]) in TH_LEAN:
+                b_.insert(0, a_.pop())
+            while len(b_) > 1 and bare(b_[0]) in TH_TAIL and \
+                    _visible_len(joined(a_ + b_[:1])) <= limit * 2:
+                a_.append(b_.pop(0))
+
+        # 2c. a name is one unit: if a card boundary falls inside one, move the
+        #     boundary to before the name
+        for nm in names:
+            for i in range(len(cards) - 1):
+                a_, b_ = cards[i], cards[i + 1]
+                if a_[-1]["seg"] != b_[0]["seg"]:
+                    continue
+                tail = ""
+                for k in range(len(a_) - 1, -1, -1):
+                    tail = a_[k]["t"].strip() + tail
+                    if nm.startswith(tail) and nm != tail and \
+                            (tail + joined(b_)).startswith(nm):
+                        cards[i + 1] = a_[k:] + b_
+                        cards[i] = a_[:k]
+                        break
+            cards = [c for c in cards if c]
+
+        # 3. scraps fold into a neighbour in the same shot
+        i = 0
+        while i < len(cards):
+            c = cards[i]
+            if len(cards) > 1 and (_visible_len(joined(c)) < small or
+                                   c[-1]["e"] - c[0]["s"] < 0.75):
+                prev_ok = i > 0 and cards[i - 1][-1]["seg"] == c[0]["seg"] and                     _visible_len(joined(cards[i - 1] + c)) <= limit * 2
+                next_ok = i + 1 < len(cards) and cards[i + 1][0]["seg"] == c[-1]["seg"] and                     _visible_len(joined(c + cards[i + 1])) <= limit * 2
+                if prev_ok and (not next_ok or c[0]["s"] - cards[i - 1][-1]["e"]
+                                <= cards[i + 1][0]["s"] - c[-1]["e"]):
+                    cards[i - 1] = cards[i - 1] + c
+                    del cards[i]
+                    continue
+                if next_ok:
+                    cards[i + 1] = c + cards[i + 1]
+                    del cards[i]
+                    continue
+            i += 1
+
+        seg_end = [o + (g["e"] - g["s"]) for g, o in zip(segs, offs)]
+        def break_cost(c, k):
+            # Phrase first, balance second: a Thai reader forgives uneven lines,
+            # not a line that starts "กว่าตั้งเยอะ".
+            if not c[k]["t"].strip():
+                return 999                      # a space token, not a word
+            left, right = joined(c[:k]), joined(c[k:])
+            cost = 0.3 * abs(_visible_len(left) - _visible_len(right))
+            if max(_visible_len(left), _visible_len(right)) > limit + 6:
+                cost += 40
+            if bare(c[k]) in ("แต่", "และ", "หรือ", "เพราะ", "and", "but", "or", "because"):
+                cost -= 8                       # "5 บาท / แต่กันน้ำรั่ว..."
+            if bare(c[k - 1]) in UNITS and k >= 2 and re.search(r"\d", joined(c[:k])):
+                cost -= 6                       # after "5 บาท"
+            if bare(c[k - 1]) in TH_LEAN or bare(c[k]) in TH_NOLINE:
+                cost += 30
+            gap = c[k]["s"] - c[k - 1]["e"]
+            cost -= min(12, gap * 60)           # a pause is where a line wants to end
+            for nm in names:                    # never inside a name
+                if nm in joined(c) and nm not in left and nm not in right:
+                    cost += 60
+            return cost
+
+        def key_words(c):
+            """The one idea on the card, in colour: a number with its unit, a name,
+            else the content word said hardest. Never a particle."""
+            text = joined(c)
+            for nm in names:
+                if nm in text:
+                    return [nm]
+            for k, w in enumerate(c):
+                if re.search(r"\d", w["t"]):
+                    out = [w["t"].strip()]
+                    nx = [x for x in c[k + 1:k + 3] if x["t"].strip()]
+                    if nx and bare(nx[0]) in UNITS:
+                        out.append(nx[0]["t"].strip())
+                    return out
+            plain = TH_PLAIN if thai else EN_PLAIN
+            counts = {}
+            for w in c:
+                counts[bare(w)] = counts.get(bare(w), 0) + 1
+            # a word said twice on one card ("ถูกจริง พังจริง") is the frame, not
+            # the point - the point is what changes between the two halves
+            pool = [w for w in c if bare(w) not in plain and _visible_len(bare(w)) >= 2
+                    and counts[bare(w)] == 1]
+            ads = [w for w in pool if bare(w) in TH_AD]
+            best = ads[-1] if ads else max(pool, key=lambda w: w["stress"], default=None)
+            if best is None or (best["stress"] < 0.3 and bare(best) not in TH_AD
+                                and len(c) > 2):
+                return []
+            out = [best["t"].strip()]
+            k = c.index(best)
+            nx = [x for x in c[k + 1:k + 3] if x["t"].strip()]
+            if nx and bare(nx[0]) in ("กว่า", "สุด", "ที่สุด", "มาก"):
+                out.append(nx[0]["t"].strip())
+            return out
+
+        for c in cards:
+            text = joined(c)
+            if _visible_len(text) > limit and len(c) > 1:
+                k = min(range(1, len(c)), key=lambda k: break_cost(c, k))
+                text = joined(c[:k]) + "\n" + joined(c[k:])
+            cues.append({"s": max(0.0, c[0]["s"] - 0.07), "e": c[-1]["e"] + 0.25,
+                         "text": text, "seg": c[0]["seg"], "key": key_words(c)})
+        for i, c in enumerate(cues):
+            # never past the end of its own shot, never into the next card;
+            # a short card is held a little longer if there is room to read it
+            stop = seg_end[c["seg"]]
+            begin = offs[c["seg"]]
+            if c["s"] < begin + 0.2:
+                c["s"] = (begin + 1.5 / fps) if c["seg"] else max(0.0, c["s"])
+            nxt = cues[i + 1]["s"] if i + 1 < len(cues) else 1e9
+            c["e"] = min(max(c["e"], c["s"] + 0.8), stop - 1.0 / fps, nxt)
+            if stop - c["e"] < 0.5 and nxt >= stop:
+                c["e"] = stop - 0.5 / fps
+        if cues and cues[-1]["seg"] == len(segs) - 1:
+            cues[-1]["e"] = total               # the sign-off card holds to the end
+        # the recogniser mishears; a person reads the captions and corrects them
+        for wrong, right in (a.get("fix_words") or {}).items():
+            for c in cues:
+                c["text"] = c["text"].replace(wrong, right)
+
+    # sound design: only where something happens
+    # A whoosh peaks 0.39s into the sample, so it starts that much early to peak ON
+    # the cut, and stays well under the voice - it is felt, not heard. Only where
+    # the picture really changes place, and never where a word follows straight on.
+    sfx = []
+    if pace["sfx"] >= 1:
+        for i in range(1, len(segs)):
+            changed = segs[i]["clip"] != segs[i - 1]["clip"]
+            first_w = min((w["s"] for w in segs[i]["words"]), default=9.0) - segs[i]["s"]
+            prev = segs[i - 1]
+            last_w = offs[i - 1] + (max((w["e"] for w in prev["words"]), default=-9.0)
+                                    - prev["s"])
+            start_at = max(offs[i] - 0.39, last_w + 0.05)
+            if changed and first_w > 0.25 and offs[i] - start_at > 0.15:
+                sfx.append({"sound": "whoosh", "at": "%.3f" % max(0.0, start_at),
+                            "gain": 0.05 if pace["sfx"] == 1 else 0.09})
+    if pace["sfx"] >= 2:
+        last = -99.0
+        for g, o in zip(segs, offs):
+            if g.get("punch_at") is not None and o + g["punch_at"] - last >= 5.0:
+                sfx.append({"sound": "pop", "at": "%.3f" % (o + g["punch_at"]),
+                            "gain": 0.22})
+                last = o + g["punch_at"]
+    if pace["sfx"] >= 2:
+        strongest = max((g for g in segs if g.get("punch_at") is not None),
+                        key=lambda g: max(w.get("stress", 0) for w in g["words"]),
+                        default=None)
+        if strongest:
+            i = segs.index(strongest)
+            sfx.append({"sound": "impact", "at": "%.3f" % (offs[i] + strongest["punch_at"]),
+                        "gain": 0.45})
+
+    music, music_note = None, "none"
+    m_arg = a.get("music", "auto")
+    if m_arg and m_arg != "none":
+        if m_arg == "auto":
+            music, music_note = _pick_music(energy, total)
+        else:
+            music = check_input(m_arg, "music")
+            music_note = os.path.basename(music)
+
+    # --- the plan, in words ----------------------------------------------------------
+    lines = []
+    for i, (g, o) in enumerate(zip(segs, offs)):
+        txt = "".join(w["t"] for w in g["words"]).strip() or "(no speech - cutaway)"
+        if len(txt) > 38:
+            txt = txt[:36] + "..."
+        bits = ["zoom %.2f" % g["base"]]
+        if g.get("punch_at") is not None:
+            bits.append("push in on '%s'" % g["stress_word"])
+        if g["drift"]:
+            bits.append("slow drift")
+        if i and g.get("join") == "fade":
+            bits.append("soft cut")
+        lines.append("  %5.2fs  clip %d %5.2f-%5.2f  %-40s %s"
+                     % (o, g["clip"] + 1, g["s"], g["e"], txt, ", ".join(bits)))
+    raw_len = sum(c["dur"] for c in clips)
+    plan = ("%d takes from %d clip(s): %.1fs of raw footage -> %.1fs.\n"
+            % (len(segs), len(clips), raw_len, total)) + "\n".join(lines)
+    plan += "\n  Music: %s. Sounds: %d. Captions: %d cue(s)." % (music_note, len(sfx), len(cues))
+    if fillers_cut:
+        plan += "\n  Fillers cut: %s" % ", ".join(fillers_cut)
+    if dropped:
+        plan += "\n  Dropped to fit %.0fs: %s" % (target, " | ".join(dropped))
+    if not any(c["focus"][2] for c in clips):
+        plan += "\n  No face found - pushes aim at the upper centre."
+    if a.get("plan_only"):
+        return "PLAN (nothing rendered)\n" + "\n".join(notes) + "\n" + plan
+
+    # --- 9. render the takes, then one build pass ------------------------------------
+    tmp = _tmpdir()
+    stamp = "%d_%d" % (os.getpid(), int(time.time()))
+    for g in segs:
+        g["vgain"] = clips[g["clip"]].get("vgain", 0.0)
+    jobs = [(clips[g["clip"]]["src"], g, os.path.join(tmp, "he_%s_%02d.mkv" % (stamp, i)))
+            for i, g in enumerate(segs)]
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        pieces = list(ex.map(lambda j: _render_piece(j[0], j[1], W, H, fps, j[2]), jobs))
+
+    out = make_output(srcs[0], "human", a.get("output"), ".mp4")
+    build = {"paths": pieces, "transition": [g.get("join", "cut") for g in segs[1:]],
+             "duration": SOFT, "audio_crossfade": SOFT, "output": out,
+             "fps": fps, "language": lang, "model": model,
+             # AAC overshoots the limiter by about a dB, measured -0.5 dB against -1.5
+             "true_peak": -2.5}
+    if cues:
+        build["captions"] = [{"start": "%.3f" % c["s"], "end": "%.3f" % c["e"],
+                              "text": c["text"], "key": c.get("key"), "lock": True}
+                             for c in cues]
+        build["font_scale"] = 1.9      # ~80px on 1080 wide - Thai TikTok size
+        build["font"] = a.get("font") or "Kanit"   # the Thai social-media face
+        # Above the TikTok/Reels bottom bar (caption, buttons) - 0.14 sat inside it.
+        build["margin_bottom"] = 0.25
+        # One word lit per card, not every word in turn: the flicker of a
+        # highlight on every syllable is the auto-caption look.
+        build["highlight"] = a.get("highlight") or "key"
+        for k in ("font", "font_scale", "accent", "text_color", "margin_bottom",
+                  "outline", "glow"):
+            if a.get(k) is not None:
+                build[k] = a[k]
+    if sfx:
+        build["sfx"] = sfx
+    if music:
+        build["music"] = music
+        if a.get("music_volume") is not None:
+            build["music_volume"] = float(a["music_volume"])
+        # Where the voice is, on the finished clock - the bed dips under these,
+        # smoothly, instead of a compressor pumping in every breath.
+        spans = []
+        for g, o in zip(segs, offs):
+            for w in g["words"]:
+                spans.append([o + w["s"] - g["s"], o + w["e"] - g["s"]])
+            if g.get("tail_voice"):
+                ts_, te_ = g["tail_voice"]
+                spans.append([o + ts_ - g["s"], o + te_ - g["s"]])
+        build["speech_spans"] = spans
+    if a.get("grain") is not None:
+        build["grain"] = a["grain"]
+    t_build(build)
+    for p in pieces:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+    # --- 10. check its own work --------------------------------------------------------
+    report = []
+    flat_t = []
+    for g, o in zip(segs, offs):
+        flat_t += [(o + w["s"] - g["s"], o + w["e"] - g["s"]) for w in g["words"]]
+    # A pause only counts as dead air if the finished picture is still during it -
+    # a silent wrench being bent is the point, not a gap.
+    mo_out = _motion_curve(out, 10) or []
+    worst_gap, action_gaps = 0.0, 0
+    for a_, b in zip(flat_t, flat_t[1:]):
+        gap = b[0] - a_[1]
+        if gap <= 0.3:
+            continue
+        span = mo_out[int(a_[1] * 10):int(b[0] * 10)]
+        if span and statistics.mean(span) > 2.5:
+            action_gaps += 1
+            continue
+        worst_gap = max(worst_gap, gap)
+    report.append(("PASS" if worst_gap <= pace["gap"] + pace["pad"] + 0.25 else "LOOK")
+                  + "  longest dead pause: %.2fs%s" % (worst_gap, (
+                      " (%d silent stretch(es) kept because something happens)"
+                      % action_gaps) if action_gaps else ""))
+    events = sorted(set(offs + [o + g["punch_at"] for g, o in zip(segs, offs)
+                                if g.get("punch_at") is not None] + [total]))
+    still = 0.0
+    for (g, o) in zip(segs, offs):
+        if not g["drift"]:
+            nxt = min([e for e in events if e > o + 0.01] or [total])
+            still = max(still, nxt - o)
+    report.append(("PASS" if still <= pace["static"] + 0.3 else "LOOK")
+                  + "  longest still picture: %.1fs (limit %.1fs)" % (still, pace["static"]))
+    lufs, peak = _loudness(out), _peak_db(out)
+    if lufs is not None:
+        report.append(("PASS" if abs(lufs + 14) <= 1.0 else "FIX ")
+                      + "  loudness %.1f LUFS (platforms want -14)" % lufs)
+    if peak is not None:
+        report.append(("PASS" if peak <= -1.0 else "FIX ") + "  peak %.1f dB" % peak)
+    vdur, adur = video_duration_of(out), duration_of(out)
+    report.append(("PASS" if abs(vdur - adur) < 0.1 else "FIX ")
+                  + "  picture %.2fs / sound %.2fs" % (vdur, adur))
+    report.append("NEXT  video_look_at + video_review on the result - captions and "
+                  "framing are only judged by looking.")
+    return done(out, "\n".join(notes) + "\n" + plan + "\n\nSELF-CHECK\n  " +
+                "\n  ".join(report))
+
+
 TOOLS = [
+    {
+        "name": "video_human_edit",
+        "description": "EDIT LIKE A PERSON: raw clips in, a finished cut out. Cuts the pauses "
+                       "and the ums on silence (not on the recogniser's word ends, which clip "
+                       "syllables), alternates the framing on jump cuts so they read as a "
+                       "second camera, pushes in on the stressed word, never lets the picture "
+                       "sit still too long, writes short Reels-style captions, lays a real "
+                       "music track from the local library ducked under the voice, and puts "
+                       "a sound only where something happens. Give a 'reference' video to copy "
+                       "its pace. Ends with a self-check of its own result. Use plan_only "
+                       "first to see every decision.",
+        "handler": t_human_edit,
+        "inputSchema": {"type": "object", "properties": {
+            "paths": {"type": "array", "items": {"type": "string"},
+                      "description": "Raw clips, in play order."},
+            "reference": {"type": "string",
+                          "description": "A video whose pace to copy (how often its picture "
+                                         "changes). Optional."},
+            "energy": {"type": "string", "enum": ["calm", "normal", "hype"],
+                       "description": "Overrides the pace read from the reference. "
+                                      "Default 'normal'."},
+            "target_seconds": {"type": "number",
+                               "description": "Drop the weakest takes until it fits."},
+            "music": {"type": "string",
+                      "description": "'auto' (default: a track from ~/Downloads/music chosen by "
+                                     "tempo), 'none', or a file path."},
+            "music_volume": {"type": "number", "description": "Leave unset: the level is measured against the voice so the music stays background. A number forces a raw gain."},
+            "captions": {"type": "boolean", "description": "Default true."},
+            "script": {"type": "string",
+                       "description": "What is actually said, if you have it (the lines "
+                                      "from the shot prompts). Captions take its spelling and "
+                                      "keep the recogniser's timing - the only way to catch a "
+                                      "mishearing that is still two real words."},
+            "names": {"type": "array", "items": {"type": "string"},
+                      "description": "Brand or people names as they should be spelt, e.g. "
+                                     "['บุญชัยฮาร์ดแวร์']. Kept whole on one card and coloured."},
+            "highlight": {"type": "string", "enum": ["key", "word", "none"],
+                          "description": "key (default): one word per card in colour. "
+                                         "word: every word lights as it is said."},
+            "fix_words": {"type": "object",
+                          "description": "Misheard words to correct in the captions, "
+                                         "{\"heard\": \"right\"} - e.g. {\"ทูก\": \"ถูก\"}."},
+            "language": {"type": "string", "description": "'th', 'en' or 'auto'."},
+            "model": {"type": "string", "enum": ["small", "medium", "large-v3"],
+                      "description": "Recogniser. Default large-v3 (Thai needs it)."},
+            "font": {"type": "string", "enum": list(SUBTITLE_FONTS)},
+            "font_scale": {"type": "number"}, "accent": {"type": "string"},
+            "grain": {"type": "number"},
+            "plan_only": {"type": "boolean",
+                          "description": "Report every decision, render nothing."},
+            "output": {"type": "string"}},
+            "required": ["paths"]},
+    },
+    {
+        "name": "video_director",
+        "description": "DECIDES THE EDIT ITSELF, then cuts it. Watches the footage - how dark "
+                       "it is, how much it moves, how much is spoken, in what language - and "
+                       "chooses the running time, the grade, whether to caption and in which "
+                       "language, the music and its level, how each join is treated, and "
+                       "whether transition sounds help or distract. Then it cuts, grades, "
+                       "captions and quality-checks the result. Every decision is reported "
+                       "with the measurement behind it, and any one of them can be overridden. "
+                       "Use this instead of video_auto_edit when you want the machine to "
+                       "decide rather than be told.",
+        "handler": t_director,
+        "inputSchema": {"type": "object", "properties": {
+            "paths": {"type": "array", "items": {"type": "string"},
+                      "description": "Raw clips, in the order they should play."},
+            "platform": {"type": "string", "enum": sorted(PLATFORM_LENGTH),
+                         "description": "Where it is going - this sets the running time it "
+                                        "aims for. Default 'tiktok' (about 24s)."},
+            "plan_only": {"type": "boolean",
+                          "description": "Report every decision and why, and render nothing. "
+                                         "Use this first when the footage is unfamiliar."},
+            "target_duration": {"type": "number", "description": "Override the length."},
+            "style": {"type": "string", "enum": list(EDIT_STYLES),
+                      "description": "Override the grade it chose."},
+            "subtitles": {"type": "string",
+                          "description": "Override the caption language ('th', 'en', or "
+                                         "'none' to switch them off)."},
+            "subtitle_style": {"type": "string", "enum": list(SUBTITLE_PRESETS)},
+            "subtitle_model": {"type": "string",
+                               "enum": ["tiny", "base", "small", "medium", "large-v3"]},
+            "music": {"type": "string", "enum": list(MUSIC_MOODS),
+                      "description": "Override the music mood."},
+            "sfx": {"anyOf": [{"type": "boolean"}, {"type": "string"}],
+                    "description": "Override the transition sounds."},
+            "transition_duration": {"type": "number"},
+            "aspect": {"type": "string"},
+            "protect_shots": {"type": "array", "items": {"type": "integer"},
+                              "description": "Shot numbers that must survive the trim - the "
+                                             "product reveal, the joke, the thing that matters."},
+            "end_title": {"type": "string", "description": "Append an end card with this headline."},
+            "end_subtitle": {"type": "string"},
+            "proof": {"type": "boolean",
+                      "description": "Fast rough render to judge the cut before the real export."},
+            "output": {"type": "string"}},
+            "required": ["paths"]},
+    },
     {
         "name": "clip_stretch",
         "description": "Every usable shot hiding inside a few clips. Built for a hard cap - "
@@ -9175,6 +11149,8 @@ TOOLS = [
                         "sound": {"type": "string"}, "at": {"type": "string"},
                         "gain": {"type": "number"}}}},
             "music": {"type": "string"}, "music_volume": {"type": "number"},
+            "duck": {"type": "boolean",
+                     "description": "Default true: the music dips under the voice."},
             "target_lufs": {"type": "number"}, "true_peak": {"type": "number"},
             "fps": {"type": "integer"}, "output": {"type": "string"}},
             "required": ["paths"]},
