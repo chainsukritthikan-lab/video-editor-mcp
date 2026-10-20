@@ -3370,8 +3370,9 @@ def _render_kinetic_ass(a, src, payload, w, h, total, font, out, text_only=False
         "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
         "Style: K,%s,%d,%s,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,%d,2,2,"
         "60,60,%d,1" % (font, size, primary, outline, margin_v),
-        "Style: C,%s,%d,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,%d,3,5,"
-        "50,50,0,1" % (font, _hook_size(a.get("cta"), size, w), max(2, int(outline * 1.6))),
+        "Style: C,%s,%d,&H003BD4FF,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,%d,3,2,"
+        "50,50,%d,1" % (font, _hook_size(a.get("cta"), size, w), max(2, int(outline * 1.6)),
+                        margin_v),
         "Style: H,%s,%d,&H003BD4FF,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,%d,3,8,"
         "50,50,%d,1" % (font, _hook_size(a.get("hook"), size, w), max(2, int(outline * 1.6)),
                         int(round(h * 0.17))),
@@ -10383,6 +10384,16 @@ def t_human_edit(a):
             g["base"] = 1.0
             if segs[i - 1]["clip"] == g["clip"]:
                 g["join"] = "fade"
+        g_len_ = g["e"] - g["s"]
+        if g.get("punch_at") is None and g["base"] <= 1.0 and g_len_ > pace["static"] \
+                and len(g["words"]) >= 2:
+            mid_ = g_len_ / 2.0
+            gaps_ = [((w0["e"] + w1["s"]) / 2.0 - g["s"]) for w0, w1 in
+                     zip(g["words"], g["words"][1:])]
+            gaps_ = [t for t in gaps_ if 1.2 <= t <= g_len_ - 1.2]
+            if gaps_:
+                g["punch_at"] = min(gaps_, key=lambda t: abs(t - mid_))
+                g["punch"] = max(pace["punch"], 0.12)
         if g["base"] > 1.0 and g.get("punch_at") is not None and (g["e"] - g["s"]) < 3.0:
             g.pop("punch_at", None)
             g.pop("stress_word", None)
@@ -10719,7 +10730,7 @@ def t_human_edit(a):
             txt = txt[:36] + "..."
         bits = ["zoom %.2f" % g["base"]]
         if g.get("punch_at") is not None:
-            bits.append("push in on '%s'" % g["stress_word"])
+            bits.append("push in on '%s'" % g.get("stress_word", "mid-take"))
         if g["drift"]:
             bits.append("slow drift")
         if i and g.get("join") == "fade":
@@ -10759,7 +10770,7 @@ def t_human_edit(a):
             if g["e"] - g["s"] < 2.6 or o - last_b < 3.0:
                 continue
             names_ = a.get("names") or []
-            punch = g.get("punch_at")
+            punch = g.get("punch_at") if g.get("stress_word") else None
             pick_at = None
             for k in range(1, len(ws)):
                 at = (ws[k - 1]["e"] + ws[k]["s"]) / 2.0 - g["s"]
@@ -10784,13 +10795,19 @@ def t_human_edit(a):
                 for j in range(0, max(0, int(c["dur"] * 10) - n)):
                     t0 = j / 10.0
                     overlap = any(t0 < e_ and t0 + length > s_ for s_, e_ in used.get(ci, []))
-                    score = sum(mo[j:j + n]) - (1000 if overlap else 0)
+                    # weight the opening half: a window that starts on an empty
+                    # bowl and only then gets busy looks like a mistake
+                    score = sum(mo[j:j + n]) + sum(mo[j:j + n // 2]) - \
+                        (1000 if overlap else 0)
                     if best is None or score > best[0]:
                         best = (score, ci, t0)
             if best is None:
                 continue
             _sc, ci, t0 = best
             g["broll"] = (clips[ci]["src"], t0, length, pick_at)
+            if g.get("punch_at") is not None and not g.get("stress_word"):
+                g.pop("punch_at", None)
+                g["punch"] = 0.0
             if broll_mode == "stack":
                 g["broll_layout"] = "stack"
             used.setdefault(ci, []).append((t0, t0 + length))
@@ -10844,7 +10861,9 @@ def t_human_edit(a):
                 build[k] = a[k]
     if a.get("cta") and cues:
         # The ask, big, over the last beat - the last caption makes room for it.
-        cta_at = max(cues[-1]["s"] + 0.6, total - 1.4)
+        last_word = max((offs[i] + w["e"] - g["s"] for i, g in enumerate(segs)
+                         for w in g["words"]), default=total - 1.0)
+        cta_at = min(total - 0.5, max(last_word + 0.12, total - 1.4))
         build["cta"], build["cta_start"], build["cta_end"] = a["cta"], cta_at, total
         if build.get("captions"):
             last = build["captions"][-1]
