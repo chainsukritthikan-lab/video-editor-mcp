@@ -3333,6 +3333,13 @@ def _ass_colour(hex_colour, default="&H00FFFFFF"):
     return "&H00%s%s%s" % (c[4:6].upper(), c[2:4].upper(), c[0:2].upper())
 
 
+def _hook_size(text, size, w):
+    """Big, but never wider than 86% of the frame - measured, a Thai glyph at this
+    weight runs about 0.62 of the font size wide."""
+    n = max(1, _visible_len(str(text or "x")))
+    return int(max(size * 0.9, min(size * 1.45, 0.86 * w / (n * 0.62))))
+
+
 def _kinetic_ass_text(a, payload, w, h, font):
     """The word-by-word captions as ASS text, so both the caption tool and the
     single-pass build can draw them without duplicating the styling."""
@@ -3363,6 +3370,9 @@ def _render_kinetic_ass(a, src, payload, w, h, total, font, out, text_only=False
         "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
         "Style: K,%s,%d,%s,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,%d,2,2,"
         "60,60,%d,1" % (font, size, primary, outline, margin_v),
+        "Style: H,%s,%d,&H003BD4FF,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,%d,3,8,"
+        "50,50,%d,1" % (font, _hook_size(a.get("hook"), size, w), max(2, int(outline * 1.6)),
+                        int(round(h * 0.17))),
         "", "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"]
 
@@ -3375,6 +3385,12 @@ def _render_kinetic_ass(a, src, payload, w, h, total, font, out, text_only=False
     glow = float(a.get("glow", 1.0))
 
     events = []
+    if a.get("hook"):
+        # The question the ad answers, on screen before anyone has to listen.
+        events.append("Dialogue: 2,%s,%s,H,,0,0,0,,{\\fscx135\\fscy135"
+                      "\\t(0,160,\\fscx100\\fscy100)\\fad(0,180)}%s"
+                      % (ts(0.0), ts(float(a.get("hook_end", 1.6))),
+                         str(a["hook"]).replace("\n", "\\N")))
     if (a.get("highlight") or "word") in ("key", "none"):
         # Whole card at once, cut in hard with a 3-frame settle; white text with
         # the one word the speaker leans on in the accent colour.
@@ -8272,7 +8288,7 @@ def t_build(a):
             idx = n_in + len(extra_inputs) - 1
             # Fade the bed in and out, and duck it under the voice: a bed at one
             # flat level fights every word, which is most of why a cut "sounds off".
-            m_tail = max(0.0, total - 1.0)
+            m_tail = max(0.0, total - 0.7)
             if a.get("music_volume") is not None:
                 m_gain = float(a["music_volume"])
             else:
@@ -8285,7 +8301,7 @@ def t_build(a):
             aparts.append("[%d:a]atrim=start=%.3f,asetpts=N/SR/TB,"
                           "aloop=loop=-1:size=2e9,atrim=0:%.3f,asetpts=N/SR/TB,"
                           "aresample=48000,volume=%.4f,afade=t=in:st=0:d=0.4,"
-                          "afade=t=out:st=%.3f:d=1.0[bed0]"
+                          "afade=t=out:st=%.3f:d=0.7[bed0]"
                          % (idx, m_start, total, m_gain, m_tail))
             spans = sorted(a.get("speech_spans") or [])
             if spans and a.get("duck", True):
@@ -8299,7 +8315,7 @@ def t_build(a):
                         merged[-1][1] = max(merged[-1][1], e0)
                     else:
                         merged.append([s0, e0])
-                dip = 10 ** (-4.0 / 20)
+                dip = 10 ** (-3.0 / 20)
                 terms = []
                 for s0, e0 in merged[:60]:
                     terms.append("min(1\\,max(0\\,min((t-%.3f)/0.15\\,(%.3f-t)/0.45)))"
@@ -8316,9 +8332,9 @@ def t_build(a):
                     expr = "(%s)*(1+0.58*min(1\\,%s))" % (expr, "+".join(lifts))
                 # a human brings the music up for the last beat: +3 dB over 0.5 s,
                 # starting once the last line has finished ducking back
-                rise_at = merged[-1][1] + 0.45
+                rise_at = merged[-1][1] + 0.25
                 if total - rise_at > 0.4:
-                    expr = "(%s)*(1+0.41*min(1\\,max(0\\,(t-%.3f)/0.5)))" % (expr, rise_at)
+                    expr = "(%s)*(1+0.41*min(1\\,max(0\\,(t-%.3f)/0.3)))" % (expr, rise_at)
                 aparts.append("[bed0]volume='%s':eval=frame[bed]" % expr)
             elif a.get("duck", True):
                 aparts.append("%sasplit=2[adlg][akey]" % acur)
@@ -9566,7 +9582,7 @@ _BED_BPM = {"calm": 85, "gentle": 75, "warm": 92, "uplifting": 110, "tense": 120
 # Background, never competing: you notice it if you listen for it, you never
 # have to strain past it. A bed that is ducked further under speech can start
 # a little higher; one that is not, lower.
-BED_UNDER_VOICE_DUCKED = 12.0
+BED_UNDER_VOICE_DUCKED = 10.0
 BED_UNDER_VOICE_FLAT = 18.0
 BED_ALONE_LUFS = -16.0          # no one talking: the music IS the soundtrack
 
@@ -10698,6 +10714,9 @@ def t_human_edit(a):
                              for c in cues]
         build["font_scale"] = 1.9      # ~80px on 1080 wide - Thai TikTok size
         build["font"] = a.get("font") or "Kanit"   # the Thai social-media face
+        build["font_scale"] = a.get("font_scale") or 2.0
+        build["outline"] = a.get("outline") or 0.11       # a real stroke, reads on any shirt
+        build["accent"] = a.get("accent") or "#FFD43B"    # TikTok yellow, not pale blue
         # Above the TikTok/Reels bottom bar (caption, buttons) - 0.14 sat inside it.
         build["margin_bottom"] = 0.25
         # One word lit per card, not every word in turn: the flicker of a
@@ -10707,6 +10726,21 @@ def t_human_edit(a):
                   "outline", "glow"):
             if a.get(k) is not None:
                 build[k] = a[k]
+    if a.get("hook"):
+        build["hook"] = a["hook"]
+        build["hook_end"] = min(1.8, max(1.2, offs[1] if len(offs) > 1 else 1.6))
+        sfx.append({"sound": "pop", "at": "0.02", "gain": 0.22})
+    # one small accent where the shop's name is said - the only sound that is
+    # about the brand
+    if a.get("names") and pace["sfx"] >= 1:
+        for g, o in zip(segs, offs):
+            hit = next((w for w in g["words"] if any(
+                n.startswith(w["t"].strip()) and w["t"].strip()
+                for n in a["names"][:1])), None)
+            if hit:
+                sfx.append({"sound": "sparkle", "at": "%.3f" % (o + hit["s"] - g["s"]),
+                            "gain": 0.18})
+                break
     if sfx:
         build["sfx"] = sfx
     if music:
@@ -10807,6 +10841,11 @@ TOOLS = [
                                      "tempo), 'none', or a file path."},
             "music_volume": {"type": "number", "description": "Leave unset: the level is measured against the voice so the music stays background. A number forces a raw gain."},
             "captions": {"type": "boolean", "description": "Default true."},
+            "hook": {"type": "string",
+                     "description": "A short title shown big in the top third for the first "
+                                    "~1.6s - the question the ad answers, e.g. "
+                                    "'ฝักบัวน้ำไหลเบา?'. Leave out if the first line already "
+                                    "states the problem."},
             "script": {"type": "string",
                        "description": "What is actually said, if you have it (the lines "
                                       "from the shot prompts). Captions take its spelling and "
