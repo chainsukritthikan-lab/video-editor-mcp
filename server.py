@@ -10771,22 +10771,30 @@ def t_human_edit(a):
                 continue
             names_ = a.get("names") or []
             punch = g.get("punch_at") if g.get("stress_word") else None
-            pick_at = None
-            for k in range(1, len(ws)):
-                at = (ws[k - 1]["e"] + ws[k]["s"]) / 2.0 - g["s"]
-                if at < 0.9 or (g["e"] - g["s"]) - at < 1.8:
-                    continue
-                covered = [w for w in ws if at <= w["s"] - g["s"] < at + 1.2]
-                if any(any(n.startswith(w["t"].strip()) and w["t"].strip() for n in names_)
-                       for w in covered):
-                    continue                    # keep his face on the shop's name
-                if punch is not None and at - 0.3 <= punch <= at + 1.4:
-                    continue
-                pick_at = at
-                break
-            if pick_at is None:
+            # A whole phrase, pause to pause, 1.8-3.2s. 1.2s was too short to read
+            # as a choice - it looked like a glitch (user, 20 Oct). If no phrase in
+            # the take is long enough, no b-roll at all.
+            g_len = g["e"] - g["s"]
+            gaps = [0.0] + [(ws[k - 1]["e"] + ws[k]["s"]) / 2.0 - g["s"]
+                            for k in range(1, len(ws))] + [g_len]
+            best_span = None
+            for i0 in range(len(gaps)):
+                for i1 in range(i0 + 1, len(gaps)):
+                    at, end = gaps[i0], gaps[i1]
+                    if at < 0.6 or not 1.8 <= end - at <= 3.2:
+                        continue
+                    covered = [w for w in ws if at <= w["s"] - g["s"] < end]
+                    if any(any(n.startswith(w["t"].strip()) and w["t"].strip()
+                               for n in names_) for w in covered):
+                        continue                # keep his face on the shop's name
+                    if punch is not None and at - 0.3 <= punch <= end + 0.2:
+                        continue
+                    if best_span is None or end - at > best_span[1] - best_span[0]:
+                        best_span = (at, end)
+            if best_span is None:
                 continue
-            length = 1.2
+            pick_at = best_span[0]
+            length = round(best_span[1] - best_span[0], 2)
             best = None
             for ci in pool:
                 c = clips[ci]
