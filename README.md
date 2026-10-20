@@ -20,6 +20,12 @@ video_human_edit(paths=["shot1.mp4", "shot2.mp4", "shot3.mp4"],
                  script="the lines that are actually said, if you have them")
 ```
 
+Optional extras: `hook` (a big title for the first ~1.6s - the question the ad answers),
+`cta` (the ask, big over the last beat), and `broll` - `auto` cuts to the action from a
+faceless clip for ~1.2s over long talking takes while the voice carries on, `stack` does
+the same as a split screen (footage on top, speaker underneath, caption on the seam),
+`none` turns it off.
+
 `names` are kept whole on one caption card and coloured. `script` is optional; when
 given, captions take its spelling and keep the speech recogniser's timing — the only
 way to catch a mishearing that is still two real words.

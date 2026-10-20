@@ -3370,6 +3370,8 @@ def _render_kinetic_ass(a, src, payload, w, h, total, font, out, text_only=False
         "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
         "Style: K,%s,%d,%s,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,%d,2,2,"
         "60,60,%d,1" % (font, size, primary, outline, margin_v),
+        "Style: C,%s,%d,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,%d,3,5,"
+        "50,50,0,1" % (font, _hook_size(a.get("cta"), size, w), max(2, int(outline * 1.6))),
         "Style: H,%s,%d,&H003BD4FF,&H000000FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,%d,3,8,"
         "50,50,%d,1" % (font, _hook_size(a.get("hook"), size, w), max(2, int(outline * 1.6)),
                         int(round(h * 0.17))),
@@ -3385,6 +3387,11 @@ def _render_kinetic_ass(a, src, payload, w, h, total, font, out, text_only=False
     glow = float(a.get("glow", 1.0))
 
     events = []
+    if a.get("cta"):
+        events.append("Dialogue: 2,%s,%s,C,,0,0,0,,{\\fscx130\\fscy130"
+                      "\\t(0,160,\\fscx100\\fscy100)}%s"
+                      % (ts(float(a.get("cta_start", 0))), ts(float(a.get("cta_end", 0))),
+                         str(a["cta"]).replace("\n", "\\N")))
     if a.get("hook"):
         # The question the ad answers, on screen before anyone has to listen.
         events.append("Dialogue: 2,%s,%s,H,,0,0,0,,{\\fscx135\\fscy135"
@@ -3409,9 +3416,19 @@ def _render_kinetic_ass(a, src, payload, w, h, total, font, out, text_only=False
                     lit = b and any(b == k or (len(b) >= 2 and b in k and len(k) > 3) or
                                     (len(k) >= 2 and k in b) for k in keys)
                     parts.append("{\\c%s}%s{\\c%s}" % (accent, t_, primary) if lit else t_)
-            events.append("Dialogue: 1,%s,%s,K,,0,0,0,,{\\fscx114\\fscy114"
-                          "\\t(0,130,0.6,\\fscx100\\fscy100)}%s"
-                          % (ts(cue["s"]), ts(cue["e"]), "".join(parts)))
+            cuts_t = sorted(set([cue["s"], cue["e"]] + [
+                t for sp in (a.get("stack_spans") or []) for t in sp
+                if cue["s"] < t < cue["e"]]))
+            for pi, (p0, p1) in enumerate(zip(cuts_t, cuts_t[1:])):
+                if p1 - p0 < 0.02:
+                    continue
+                mid = any(sp[0] <= (p0 + p1) / 2.0 <= sp[1]
+                          for sp in (a.get("stack_spans") or []))
+                where = ("\\an5\\pos(%d,%d)" % (w // 2, h // 2)) if mid else ""
+                enter = ("\\fscx114\\fscy114\\t(0,130,0.6,\\fscx100\\fscy100)"
+                         if pi == 0 else "")
+                events.append("Dialogue: 1,%s,%s,K,,0,0,0,,{%s%s}%s"
+                              % (ts(p0), ts(p1), where, enter, "".join(parts)))
         payload = []
     for cue in payload:
         flat = [wd for ln in cue["lines"] for wd in ln]
@@ -9782,8 +9799,38 @@ def _render_piece(src, seg, W, H, fps, out):
           "fps=%d,zoompan=z='%s':d=1:x='(iw-iw/zoom)*%.4f':y='(ih-ih/zoom)*%.4f':"
           "s=%dx%d:fps=%d,setsar=1,format=yuv420p"
           % (W * 2, H * 2, W * 2, H * 2, fps, esc_expr(z), fx, fy, W, H, fps))
-    args = ["-ss", "%.3f" % seg["s"], "-i", src, "-t", "%.3f" % dur, "-vf", vf,
-            "-frames:v", str(max(1, int(round(dur * fps))))]
+    br = seg.get("broll")
+    if br and has_audio(src):
+        # B-roll over the voice: the speaker keeps talking while the picture goes
+        # to the thing he is talking about, then comes back - a J/L cut inside one
+        # take. "stack" keeps his face in the bottom half and puts the footage on
+        # top, the way explainer reels do it.
+        b_src, b_s, b_len, at = br
+        b_end = at + b_len
+        bscale = ("scale=%d:%d:force_original_aspect_ratio=increase:flags=lanczos,"
+                  "crop=%d:%d" % (int(W * 1.06), int((H // 2 if seg.get("broll_layout") == "stack"
+                                                       else H) * 1.06),
+                                  W, H // 2 if seg.get("broll_layout") == "stack" else H))
+        if seg.get("broll_layout") == "stack":
+            fy_px = max(0, min(H // 2, int(fy * H - H * 0.20)))
+            graph = ("[0:v]%s[base];[base]split[full][cp];"
+                     "[cp]crop=%d:%d:0:%d[spk];"
+                     "[1:v]%s,fps=%d,setsar=1,format=yuv420p,setpts=PTS-STARTPTS+%.3f/TB[top];"
+                     "[top][spk]vstack[stk];"
+                     "[full][stk]overlay=0:0:enable='between(t,%.3f,%.3f)':eof_action=pass[v]"
+                     % (vf, W, H // 2, fy_px, bscale, fps, at, at, b_end))
+        else:
+            graph = ("[0:v]%s[base];"
+                     "[1:v]%s,fps=%d,setsar=1,format=yuv420p,setpts=PTS-STARTPTS+%.3f/TB[b];"
+                     "[base][b]overlay=0:0:enable='between(t,%.3f,%.3f)':eof_action=pass[v]"
+                     % (vf, bscale, fps, at, at, b_end))
+        args = ["-ss", "%.3f" % seg["s"], "-i", src,
+                "-ss", "%.3f" % b_s, "-t", "%.3f" % (b_len + 0.2), "-i", b_src,
+                "-t", "%.3f" % dur, "-filter_complex", graph, "-map", "[v]", "-map", "0:a",
+                "-frames:v", str(max(1, int(round(dur * fps))))]
+    else:
+        args = ["-ss", "%.3f" % seg["s"], "-i", src, "-t", "%.3f" % dur, "-vf", vf,
+                "-frames:v", str(max(1, int(round(dur * fps))))]
     if has_audio(src):
         # Tiny fades at both ends: a cut through a waveform clicks.
         # Exactly as long as the picture, in PCM. AAC pads every piece to a whole
@@ -10692,6 +10739,68 @@ def t_human_edit(a):
     if a.get("plan_only"):
         return "PLAN (nothing rendered)\n" + "\n".join(notes) + "\n" + plan
 
+    # --- 8b. b-roll over long talking takes ------------------------------------------
+    # A talking head held for 6s reads as two clips joined end to end. A human
+    # editor cuts away to the thing being talked about while the voice carries on.
+    # Footage comes from clips without a face (hands, the product, the job), the
+    # parts the cut did not use first, its busiest 1.2s.
+    broll_mode = (a.get("broll") or "auto").lower()
+    broll_notes = []
+    if broll_mode != "none":
+        pool = [ci for ci, c in enumerate(clips) if not c["focus"][2]]
+        used = {}
+        for g in segs:
+            used.setdefault(g["clip"], []).append((g["s"], g["e"]))
+        last_b = -99.0
+        for gi, (g, o) in enumerate(zip(segs, offs)):
+            ws = g["words"]
+            if not pool or not ws or not clips[g["clip"]]["focus"][2]:
+                continue
+            if g["e"] - g["s"] < 2.6 or o - last_b < 3.0:
+                continue
+            names_ = a.get("names") or []
+            punch = g.get("punch_at")
+            pick_at = None
+            for k in range(1, len(ws)):
+                at = (ws[k - 1]["e"] + ws[k]["s"]) / 2.0 - g["s"]
+                if at < 0.9 or (g["e"] - g["s"]) - at < 1.8:
+                    continue
+                covered = [w for w in ws if at <= w["s"] - g["s"] < at + 1.2]
+                if any(any(n.startswith(w["t"].strip()) and w["t"].strip() for n in names_)
+                       for w in covered):
+                    continue                    # keep his face on the shop's name
+                if punch is not None and at - 0.3 <= punch <= at + 1.4:
+                    continue
+                pick_at = at
+                break
+            if pick_at is None:
+                continue
+            length = 1.2
+            best = None
+            for ci in pool:
+                c = clips[ci]
+                mo = list(c["motion"] or [])
+                n = int(length * 10)
+                for j in range(0, max(0, int(c["dur"] * 10) - n)):
+                    t0 = j / 10.0
+                    overlap = any(t0 < e_ and t0 + length > s_ for s_, e_ in used.get(ci, []))
+                    score = sum(mo[j:j + n]) - (1000 if overlap else 0)
+                    if best is None or score > best[0]:
+                        best = (score, ci, t0)
+            if best is None:
+                continue
+            _sc, ci, t0 = best
+            g["broll"] = (clips[ci]["src"], t0, length, pick_at)
+            if broll_mode == "stack":
+                g["broll_layout"] = "stack"
+            used.setdefault(ci, []).append((t0, t0 + length))
+            last_b = o + pick_at
+            broll_notes.append("%.2fs: %.1fs of clip %d over the voice%s"
+                               % (o + pick_at, length, ci + 1,
+                                  " (split screen)" if broll_mode == "stack" else ""))
+    if broll_notes:
+        notes.append("B-roll: " + "; ".join(broll_notes))
+
     # --- 9. render the takes, then one build pass ------------------------------------
     tmp = _tmpdir()
     stamp = "%d_%d" % (os.getpid(), int(time.time()))
@@ -10708,6 +10817,13 @@ def t_human_edit(a):
              "fps": fps, "language": lang, "model": model,
              # AAC overshoots the limiter by about a dB, measured -0.5 dB against -1.5
              "true_peak": -2.5}
+    stack_spans = []
+    for g, o in zip(segs, offs):
+        if g.get("broll") and g.get("broll_layout") == "stack":
+            _b, _bs, b_len, b_at = g["broll"]
+            stack_spans.append([o + b_at, o + b_at + b_len])
+    if stack_spans:
+        build["stack_spans"] = stack_spans
     if cues:
         build["captions"] = [{"start": "%.3f" % c["s"], "end": "%.3f" % c["e"],
                               "text": c["text"], "key": c.get("key"), "lock": True}
@@ -10726,6 +10842,13 @@ def t_human_edit(a):
                   "outline", "glow"):
             if a.get(k) is not None:
                 build[k] = a[k]
+    if a.get("cta") and cues:
+        # The ask, big, over the last beat - the last caption makes room for it.
+        cta_at = max(cues[-1]["s"] + 0.6, total - 1.4)
+        build["cta"], build["cta_start"], build["cta_end"] = a["cta"], cta_at, total
+        if build.get("captions"):
+            last = build["captions"][-1]
+            last["end"] = "%.3f" % max(float(last["start"]) + 0.5, cta_at)
     if a.get("hook"):
         build["hook"] = a["hook"]
         build["hook_end"] = min(1.8, max(1.2, offs[1] if len(offs) > 1 else 1.6))
@@ -10841,6 +10964,13 @@ TOOLS = [
                                      "tempo), 'none', or a file path."},
             "music_volume": {"type": "number", "description": "Leave unset: the level is measured against the voice so the music stays background. A number forces a raw gain."},
             "captions": {"type": "boolean", "description": "Default true."},
+            "broll": {"type": "string", "enum": ["auto", "stack", "none"],
+                      "description": "auto (default): cut to the action from a faceless "
+                                     "clip for ~1.2s over long talking takes. stack: same, "
+                                     "but as a split screen with the speaker underneath."},
+            "cta": {"type": "string",
+                    "description": "The ask, shown big over the last ~1.4s, e.g. "
+                                   "'คอมเมนต์ถามเฮียได้เลย'."},
             "hook": {"type": "string",
                      "description": "A short title shown big in the top third for the first "
                                     "~1.6s - the question the ad answers, e.g. "
