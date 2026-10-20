@@ -10349,7 +10349,7 @@ def t_human_edit(a):
         g = segs[-1]
         room = clips[g["clip"]]["dur"] - g["e"]
         last_w = max((w["e"] for w in g["words"]), default=g["e"])
-        want_end = last_w + 1.0
+        want_end = last_w + 1.4
         env = clips[g["clip"]]["env"]
         if env is not None:
             db, thr = env
@@ -10800,13 +10800,18 @@ def t_human_edit(a):
                 c = clips[ci]
                 mo = list(c["motion"] or [])
                 n = int(length * 10)
-                for j in range(0, max(0, int(c["dur"] * 10) - n)):
+                # Only footage the viewer has NOT seen, and never from before
+                # what they have seen of that clip: the head going back into the
+                # bowl after we watched it soak read as a loop or a mistake
+                # (judge, 20 Oct). If the clip has nothing fresh, no b-roll.
+                seen_to = max((e_ for s_, e_ in used.get(ci, [])), default=0.0)
+                for j in range(int(seen_to * 10), max(0, int(c["dur"] * 10) - n)):
                     t0 = j / 10.0
-                    overlap = any(t0 < e_ and t0 + length > s_ for s_, e_ in used.get(ci, []))
+                    if any(t0 < e_ and t0 + length > s_ for s_, e_ in used.get(ci, [])):
+                        continue
                     # weight the opening half: a window that starts on an empty
                     # bowl and only then gets busy looks like a mistake
-                    score = sum(mo[j:j + n]) + sum(mo[j:j + n // 2]) - \
-                        (1000 if overlap else 0)
+                    score = sum(mo[j:j + n]) + sum(mo[j:j + n // 2])
                     if best is None or score > best[0]:
                         best = (score, ci, t0)
             if best is None:
