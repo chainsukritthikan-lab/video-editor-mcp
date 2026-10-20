@@ -9800,7 +9800,8 @@ TH_AD = frozenset("""ถูก แพง ฟรี ลด คุ้ม ทน �
 cheap free new fast best save""".split())
 # Never the coloured word: particles and grammar carry no meaning on their own.
 TH_PLAIN = TH_LEAN | TH_TAIL | frozenset("""ก็ ๆ แล้ว นี้ นั้น นี่ มัน เขา เรา คุณ ผม หนู
-ต้อง ใช้ มี ทุก ได้ ให้ อ้าว เอ๊ะ โอ้ อืม""".split())
+ต้อง ใช้ มี ทุก ได้ ให้ อ้าว เอ๊ะ โอ้ อืม เรื่อง ไหน อะไร ยังไง ทำไม
+ตรงไหน แบบ อัน ตัว""".split())
 EN_PLAIN = frozenset("""a an the of to in on at for and or but so is are was were be it this
 that with from by as i you we they he she my your our just really very""".split())
 UNITS = frozenset("บาท ปี วัน เดือน นาที ชั่วโมง เท่า % ชิ้น อัน ตัว เมตร ลิตร กิโล baht".split())
@@ -10527,6 +10528,11 @@ def t_human_edit(a):
                 return 999                      # a space token, not a word
             left, right = joined(c[:k]), joined(c[k:])
             cost = 0.3 * abs(_visible_len(left) - _visible_len(right))
+            # a line that is one short word on its own ("พิมพ์ / ถามเฮีย...") reads
+            # as a mistake - unless it is a price ("5 บาท / แต่...")
+            for side in (left, right):
+                if _visible_len(side) < 7 and not re.search(r"\d", side):
+                    cost += 25
             if max(_visible_len(left), _visible_len(right)) > limit + 6:
                 cost += 40
             if bare(c[k]) in ("แต่", "และ", "หรือ", "เพราะ", "and", "but", "or", "because"):
